@@ -1,0 +1,34 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: toolchain
+        run: |
+          sw_vers
+          swift --version
+          echo "bash: $BASH_VERSION"
+          command -v jq python3 shasum lockf || true
+          jq --version || true
+
+      - name: build
+        run: .github/scripts/run-step.sh "swift build" swift build -c release
+
+      - name: provider selection tests
+        run: .github/scripts/run-step.sh "provider selection tests" bash tests/test-usage-provider-selection.sh
+
+      - name: claude usage poll tests
+        run: .github/scripts/run-step.sh "claude usage poll tests" bash tests/test-claude-usage-poll.sh
+
+      - name: usage log rotation tests
+        run: .github/scripts/run-step.sh "usage log rotation tests" bash tests/test-usage-log-rotation.sh
