@@ -189,6 +189,22 @@ HOME="$fake_home" PATH="$scratch/bin:$PATH" CLAUDE_USAGE_TIMEOUT=2 \
   "$bin" poll-usage >/dev/null 2>&1 || true
 check "after timeout: state" "ok" "$(field "$appdir/claude-collector-state.json" status)"
 
+# --- 12) a statusLine render without rate_limits (Claude Code 2.1.x) leaves
+# the /usage snapshot alone instead of blanking it until the next poll
+before="$(cat "$appdir/snapshot.json")"
+text="$(printf '%s' '{"model":{"id":"claude-opus-5-5","display_name":"Opus 5.5"},"session_id":"x"}' \
+  | HOME="$fake_home" "$bin" statusline 2>/dev/null)"
+check "statusline without limits: snapshot untouched" "$before" "$(cat "$appdir/snapshot.json")"
+check "statusline without limits: status text" "⏱ AI Usage · Claude (rate_limits 대기…)" "$text"
+[ ! -e "$appdir/snapshot.json.tmp" ] \
+  || { failures=$((failures + 1)); echo "FAIL: statusline without limits: left snapshot.json.tmp behind" >&2; }
+
+# --- 13) with rate_limits the statusLine still replaces the snapshot
+printf '%s' '{"model":{"display_name":"Opus 5.5"},"rate_limits":{"five_hour":{"used_percentage":30,"resets_at":1893456000},"seven_day":{"used_percentage":12,"resets_at":1893456000}}}' \
+  | HOME="$fake_home" "$bin" statusline >/dev/null 2>&1
+check "statusline with limits: 5h percent" "30" "$(field "$appdir/snapshot.json" fiveHour.used_percentage)"
+check "statusline with limits: week percent" "12" "$(field "$appdir/snapshot.json" sevenDay.used_percentage)"
+
 if [ "$failures" -ne 0 ]; then
   echo "FAIL: $failures claude-usage-poll assertions failed" >&2
   exit 1

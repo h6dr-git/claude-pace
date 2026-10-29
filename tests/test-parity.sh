@@ -42,6 +42,9 @@ for file in \
   fi
   chmod +x "$legacy/$file"
 done
+# Behaviour changed on purpose since then is applied to the legacy copies too
+# (tests/parity/apply-intended-changes.py says what and why).
+python3 "$parity_dir/apply-intended-changes.py" "$legacy" || exit 1
 
 fakes="$work/bin"
 mkdir -p "$fakes"
@@ -430,6 +433,30 @@ burst_check() {
   annotate notice "codex burst" "$work/burst.txt"
 }
 
+# Not a parity case either: a session line still being written when ingest
+# runs, finished before the next run. The scripts stored the file size as the
+# next offset, so the rest of that line was read on its own and the event lost.
+partial_line_check() {
+  local impl counts="" file
+  local first='{"timestamp":"2026-10-28T01:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":12},"last_token_usage":{"total_tokens":12}}}}'
+  local second='{"timestamp":"2026-10-28T01:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":20},"last_token_usage":{"total_tokens":8}}}}'
+  for impl in legacy new; do
+    home="$work/partial-$impl"
+    rm -rf "$home"
+    mkdir -p "$home/.codex/sessions/2026/10/28"
+    step_number=0
+    file="$home/.codex/sessions/2026/10/28/rollout-p.jsonl"
+    { printf '%s\n' "$first"; printf '%s' "${second:0:60}"; } > "$file"
+    step partial-1 ingest-codex-sessions
+    printf '%s\n' "${second:60}" >> "$file"
+    step partial-2 ingest-codex-sessions
+    counts="$counts $impl:$(grep -c '"source":"codex-session"' "$(app_dir)/usage-log.jsonl")"
+  done
+  echo "session line finished between runs -> events ingested$counts (of 2)"
+  echo "line finished between runs -> events ingested$counts (of 2)" > "$work/partial.txt"
+  annotate notice "partial session line" "$work/partial.txt"
+}
+
 run_scenario scenario_ingest_codex
 run_scenario scenario_ingest_claude
 run_scenario scenario_ledger
@@ -437,6 +464,7 @@ run_scenario scenario_poll_usage
 run_scenario scenario_poll_codex
 run_scenario scenario_statusline
 burst_check
+partial_line_check
 
 [ -f "$work/digest.txt" ] && annotate notice "parity" "$work/digest.txt"
 

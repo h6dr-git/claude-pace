@@ -79,8 +79,8 @@ AI_USAGE_PRIMARY_PROVIDER=claude .build/release/ClaudePace   # Codex는 codex
 - `usage-history-summary.json` — 60초마다 갱신되는 경량 요약(보관본은 다시 훑지 않고 색인만 합산)
 - `.debug/last-input.json` — statusLine이 마지막으로 받은 입력 원문(등록한 경우에만)
 
-### statusLine — 지금은 등록하지 않는 걸 권장
-예전엔 Claude Code `statusLine`으로 한도가 들어왔지만, 2.1.x부터 statusLine 입력에 `rate_limits`가 없고 데스크톱 앱은 statusLine을 렌더하지 않음(2026-08-20 실측). 이 상태로 등록해 두면 터미널 화면을 그릴 때마다 `snapshot.json`이 빈 한도로 덮여, 다음 `/usage` 조회(최대 180초)까지 메뉴바가 `?`가 됨. 한도는 `/usage` 조회가 담당하므로 등록할 필요 없음. `statusline` 하위 명령은 예전 스크립트와 똑같이 동작하도록 남겨 둠.
+### statusLine — 지금은 등록할 필요 없음
+예전엔 Claude Code `statusLine`으로 한도가 들어왔지만, 2.1.x부터 statusLine 입력에 `rate_limits`가 없고 데스크톱 앱은 statusLine을 렌더하지 않음(2026-08-20 실측). 한도는 `/usage` 조회가 담당. 등록해 둬도 한도가 없는 입력으로는 `snapshot.json`을 건드리지 않고 기록(원장·디버그 덤프)만 남김. Claude Code가 다시 `rate_limits`를 보내면 그때부터 스냅샷도 갱신.
 
 ## 구조
 - `Sources/ClaudePace/` — AppKit 메뉴바 앱, 서드파티 의존성 0
@@ -99,7 +99,7 @@ AI_USAGE_PRIMARY_PROVIDER=claude .build/release/ClaudePace   # Codex는 codex
 
 ### 스크립트 버전에서 넘어올 때
 - `git pull` 후 `swift build -c release`로 다시 빌드. LaunchAgent는 실행 파일 경로만 맞으면 그대로 씀
-- statusLine을 등록해 뒀다면 `~/.claude/settings.json`에서 빼는 걸 권장(위 「statusLine」 참고). 계속 쓸 거면 명령을 `…/ClaudePace statusline`으로 바꿈(`bridge/statusline.sh`는 없어짐)
+- statusLine을 등록해 뒀다면 명령을 `…/ClaudePace statusline`으로 바꾸거나 `~/.claude/settings.json`에서 뺌(`bridge/statusline.sh`는 없어짐). 지금은 등록할 필요 없음(위 「statusLine」 참고)
 - 원장·오프셋·처리 기록은 그대로 이어 씀. 이벤트 id·파일 경로 규칙이 예전과 같아서 이미 넣은 기록을 다시 넣지 않음
 
 ## 겪은 문제
@@ -116,10 +116,11 @@ AI_USAGE_PRIMARY_PROVIDER=claude .build/release/ClaudePace   # Codex는 codex
 먼저 `swift build -c release`. 가짜 `claude`·`codex`를 PATH에 올려 실계정을 건드리지 않고 검증(테스트에는 `jq`·`python3` 필요). GitHub Actions(macOS)에서 커밋마다 전부 돌림.
 ```sh
 tests/test-cli.sh                        # 하위 명령 분기, 모르는 명령이면 앱을 띄우지 않고 64로 종료
-tests/test-claude-usage-poll.sh          # /usage 출력 형태별 동작, 로그아웃·빈 출력·CLI 부재·시간 초과에서 스냅샷 보존
+tests/test-claude-usage-poll.sh          # /usage 출력 형태별 동작, 로그아웃·빈 출력·CLI 부재·시간 초과·한도 없는 statusLine에서 스냅샷 보존
+tests/test-session-ingest.sh             # 쓰는 중이던 세션 줄을 다음 실행에서 빠짐없이, 한 번만 수집
 tests/test-usage-provider-selection.sh   # 공급자별 fail-closed, 0% 대신 "읽을 값 없음"
 tests/test-usage-log-rotation.sh         # 임계·월 경계 회전, 바이트·행 보존, 깨진 JSON 회전 거부
-tests/test-parity.sh                     # 예전 스크립트(git 이력)와 Swift 수집기를 같은 입력으로 돌려 결과 파일 대조
+tests/test-parity.sh                     # 예전 스크립트(git 이력)와 Swift 수집기를 같은 입력으로 돌려 결과 파일 대조(일부러 바꾼 동작은 tests/parity/apply-intended-changes.py에 명시)
 ```
 
 ## 제거
