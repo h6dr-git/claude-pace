@@ -418,6 +418,15 @@ struct UsageProviderSelectionTestMain {
             makeCollectorState("signed-out").parsedStatus?.blocksCollection == true,
             "signed-out collector blocks"
         )
+        // A `claude` call that hit the poll's time limit is named as such.
+        expect(
+            makeCollectorState("timed-out").parsedStatus == .timedOut,
+            "timed-out collector status is recognised"
+        )
+        expect(
+            makeCollectorState("timed-out").parsedStatus?.blocksCollection == true,
+            "timed-out collector blocks"
+        )
     }
 
     private static func testClaudeModeIgnoresFreshCodexSnapshot() throws {

@@ -1,0 +1,39 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The parity check reads the pre-port scripts from history.
+          fetch-depth: 0
+
+      - name: toolchain
+        run: |
+          sw_vers
+          swift --version
+          echo "::notice title=toolchain::macOS $(sw_vers -productVersion) · $(swift --version 2>&1 | head -1) · $(jq --version 2>&1) · $(python3 --version 2>&1) · bash $BASH_VERSION"
+
+      - name: build
+        run: .github/scripts/run-step.sh "swift build" swift build -c release
+
+      - name: command line tests
+        run: .github/scripts/run-step.sh "command line tests" bash tests/test-cli.sh
+
+      - name: provider selection tests
+        run: .github/scripts/run-step.sh "provider selection tests" bash tests/test-usage-provider-selection.sh
+
+      - name: claude usage poll tests
+        run: .github/scripts/run-step.sh "claude usage poll tests" bash tests/test-claude-usage-poll.sh
+
+      - name: usage log rotation tests
+        run: .github/scripts/run-step.sh "usage log rotation tests" bash tests/test-usage-log-rotation.sh
+
+      - name: parity with the pre-port scripts
+        run: .github/scripts/run-step.sh "parity" bash tests/test-parity.sh

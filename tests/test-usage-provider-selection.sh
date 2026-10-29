@@ -9,7 +9,7 @@ swiftc \
   "$repo_dir/Sources/ClaudePace/CodexUsageSnapshot.swift" \
   "$repo_dir/Sources/ClaudePace/ClaudeUsageSnapshot.swift" \
   "$repo_dir/Sources/ClaudePace/UsageProviderSelection.swift" \
-  "$repo_dir/Tests/UsageProviderSelectionTestMain.swift" \
+  "$repo_dir/tests/UsageProviderSelectionTestMain.swift" \
   -o "$scratch_dir/usage-provider-selection-tests"
 
 "$scratch_dir/usage-provider-selection-tests"

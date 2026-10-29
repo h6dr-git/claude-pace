@@ -23,22 +23,17 @@ struct UsageHistorySummary {
 final class UsageHistoryStore {
     static let shared = UsageHistoryStore()
 
-    private let appDir: URL
+    private let home: String
     private let summaryURL: URL
-    private let codexIngestURL: URL
-    private let summaryScriptURL: URL
     private let queue = DispatchQueue(label: "ClaudePace.UsageHistory")
     private var lastIngest = Date.distantPast
     private var ingestRunning = false
+    /// What the summary file on disk was built from (see rebuildSummary).
+    private var summaryInputs: String?
 
     private init() {
-        appDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/ClaudePace")
-        summaryURL = appDir.appendingPathComponent("usage-history-summary.json")
-        codexIngestURL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Developer/claude-pace/tools/ingest-codex-sessions.sh")
-        summaryScriptURL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Developer/claude-pace/tools/usage-history-summary.sh")
+        home = FileManager.default.homeDirectoryForCurrentUser.path
+        summaryURL = URL(fileURLWithPath: AppPaths(home: home).historySummary)
     }
 
     func ingestSessionsIfDue(interval: TimeInterval = 60, force: Bool = false) {
@@ -49,25 +44,14 @@ final class UsageHistoryStore {
             self.ingestRunning = true
             self.lastIngest = Date()
 
-            if FileManager.default.isExecutableFile(atPath: self.codexIngestURL.path) {
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: "/bin/bash")
-                process.arguments = [self.codexIngestURL.path]
-                process.environment = [
-                    "HOME": FileManager.default.homeDirectoryForCurrentUser.path,
-                    "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-                    "CODEX_USAGE_MTIME_DAYS": "2"
-                ]
-                process.standardOutput = FileHandle.nullDevice
-                process.standardError = FileHandle.nullDevice
-
-                do {
-                    try process.run()
-                    process.waitUntilExit()
-                } catch {
-                    // The menu bar must never fail just because history ingestion failed.
-                }
-            }
+            // The menu bar must never fail just because history ingestion
+            // failed, so the status is not checked.
+            _ = SessionIngest.run(
+                .codex,
+                home: self.home,
+                environment: ["CODEX_USAGE_MTIME_DAYS": "2"],
+                io: .silent
+            )
 
             self.rebuildSummary()
 
@@ -100,30 +84,27 @@ final class UsageHistoryStore {
     }
 
     private func rebuildSummary() {
-        guard FileManager.default.isExecutableFile(atPath: summaryScriptURL.path) else { return }
+        let log = AppPaths(home: home).usageLog
+        // Most minutes nothing was appended. Re-reading the active ledger (up
+        // to 50 MB, under the usage-log lock) would only rewrite the same
+        // summary, so skip it while the inputs look exactly as they did when
+        // the current summary file was written. Taken before the build: a
+        // change that lands during the build is seen next time.
+        let inputs = UsageHistorySummaryBuilder.inputFingerprint(log)
+        if let inputs, inputs == summaryInputs, FileManager.default.fileExists(atPath: summaryURL.path) {
+            return
+        }
 
-        let process = Process()
-        let output = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = [summaryScriptURL.path]
-        process.environment = [
-            "HOME": FileManager.default.homeDirectoryForCurrentUser.path,
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        ]
-        process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
-
+        let result = UsageHistorySummaryBuilder.build(log, environment: [:], io: .silent)
+        // Keep the last good summary when log summarization fails.
+        guard result.status == 0, let summary = result.summary else { return }
+        let data = Data((summary.prettyText + "\n").utf8)
+        guard (try? JSONDecoder().decode(UsageHistorySummaryDocument.self, from: data)) != nil else { return }
         do {
-            try process.run()
-            let data = output.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0,
-                  (try? JSONDecoder().decode(UsageHistorySummaryDocument.self, from: data)) != nil else {
-                return
-            }
             try data.write(to: summaryURL, options: .atomic)
+            summaryInputs = inputs
         } catch {
-            // Keep the last good summary when log summarization fails.
+            summaryInputs = nil
         }
     }
 }
