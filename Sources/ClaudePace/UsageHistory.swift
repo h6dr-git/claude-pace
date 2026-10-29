@@ -28,6 +28,8 @@ final class UsageHistoryStore {
     private let queue = DispatchQueue(label: "ClaudePace.UsageHistory")
     private var lastIngest = Date.distantPast
     private var ingestRunning = false
+    /// What the summary file on disk was built from (see rebuildSummary).
+    private var summaryInputs: String?
 
     private init() {
         home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -82,15 +84,27 @@ final class UsageHistoryStore {
     }
 
     private func rebuildSummary() {
-        let result = UsageHistorySummaryBuilder.build(
-            AppPaths(home: home).usageLog,
-            environment: [:],
-            io: .silent
-        )
+        let log = AppPaths(home: home).usageLog
+        // Most minutes nothing was appended. Re-reading the active ledger (up
+        // to 50 MB, under the usage-log lock) would only rewrite the same
+        // summary, so skip it while the inputs look exactly as they did when
+        // the current summary file was written. Taken before the build: a
+        // change that lands during the build is seen next time.
+        let inputs = UsageHistorySummaryBuilder.inputFingerprint(log)
+        if let inputs, inputs == summaryInputs, FileManager.default.fileExists(atPath: summaryURL.path) {
+            return
+        }
+
+        let result = UsageHistorySummaryBuilder.build(log, environment: [:], io: .silent)
         // Keep the last good summary when log summarization fails.
         guard result.status == 0, let summary = result.summary else { return }
         let data = Data((summary.prettyText + "\n").utf8)
         guard (try? JSONDecoder().decode(UsageHistorySummaryDocument.self, from: data)) != nil else { return }
-        try? data.write(to: summaryURL, options: .atomic)
+        do {
+            try data.write(to: summaryURL, options: .atomic)
+            summaryInputs = inputs
+        } catch {
+            summaryInputs = nil
+        }
     }
 }

@@ -76,6 +76,7 @@ enum ClaudeCollectorStatus: Equatable {
     case cliMissing
     case emptyOutput
     case parseFailed
+    case timedOut
     case unknown(String)
 
     static func from(rawValue: String?) -> ClaudeCollectorStatus? {
@@ -88,6 +89,7 @@ enum ClaudeCollectorStatus: Equatable {
         case "cli-missing": return .cliMissing
         case "empty-output": return .emptyOutput
         case "parse-failed": return .parseFailed
+        case "timed-out": return .timedOut
         case let other: return .unknown(other)
         }
     }
@@ -97,7 +99,7 @@ enum ClaudeCollectorStatus: Equatable {
     var blocksCollection: Bool {
         switch self {
         case .ok: return false
-        case .signedOut, .noLimits, .cliMissing, .emptyOutput, .parseFailed: return true
+        case .signedOut, .noLimits, .cliMissing, .emptyOutput, .parseFailed, .timedOut: return true
         case .unknown: return true
         }
     }
@@ -110,6 +112,7 @@ enum ClaudeCollectorStatus: Equatable {
         case .cliMissing: return "claude 명령을 찾을 수 없음"
         case .emptyOutput: return "`/usage` 출력이 비어 있음"
         case .parseFailed: return "`/usage` 출력을 해석하지 못함"
+        case .timedOut: return "claude가 응답하지 않음 — 시간 초과로 중단"
         case .unknown(let raw): return "수집기 상태 미상 (\(raw))"
         }
     }

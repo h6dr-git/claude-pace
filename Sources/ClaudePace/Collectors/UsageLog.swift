@@ -364,6 +364,35 @@ enum UsageHistorySummaryBuilder {
         return (0, merged)
     }
 
+    /// A cheap identity of everything `build` reads: the active ledger's
+    /// device, inode and size, and each file in archive/. The result depends
+    /// on nothing else (no clock), so an unchanged fingerprint means an
+    /// identical summary. nil when the ledger cannot be examined.
+    ///
+    /// The ledger's modification time is left out on purpose: ingest,
+    /// rotation and `build` itself `touch` it every run. Writers only append,
+    /// and rotation swaps in a new file, so inode and size catch every change.
+    static func inputFingerprint(_ log: String) -> String? {
+        func describe(_ path: String, withTime: Bool) -> String? {
+            var info = stat()
+            guard lstat(path, &info) == 0 else { return nil }
+            var text = "\(info.st_dev):\(info.st_ino):\(info.st_mode):\(info.st_size)"
+            if withTime {
+                text += ":\(info.st_mtimespec.tv_sec).\(info.st_mtimespec.tv_nsec)"
+            }
+            return text
+        }
+        guard let active = describe(log, withTime: false) else { return nil }
+        var parts = [active]
+        let archive = UsageLogFiles(log: log).archiveDir
+        if let names = try? FileManager.default.contentsOfDirectory(atPath: archive) {
+            for name in Shell.sortedBytewise(names) {
+                parts.append(name + "=" + (describe(archive + "/" + name, withTime: true) ?? "?"))
+            }
+        }
+        return parts.joined(separator: "\n")
+    }
+
     /// The `jq -s` merge of the per-segment summaries.
     static func merge(_ summaries: [JSONValue]) -> JSONValue? {
         var objects: [JSONObject] = []

@@ -23,6 +23,9 @@ jobs:
       - name: build
         run: .github/scripts/run-step.sh "swift build" swift build -c release
 
+      - name: command line tests
+        run: .github/scripts/run-step.sh "command line tests" bash tests/test-cli.sh
+
       - name: provider selection tests
         run: .github/scripts/run-step.sh "provider selection tests" bash tests/test-usage-provider-selection.sh
 

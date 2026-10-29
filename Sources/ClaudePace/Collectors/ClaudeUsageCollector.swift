@@ -47,33 +47,53 @@ enum ClaudeUsageCollector {
         // poll. An empty directory has nothing to walk.
         let directory = Shell.makeDirectories(paths.scratch) ? paths.scratch : "/"
 
+        // Each `claude` call gets CLAUDE_USAGE_TIMEOUT seconds (default 60).
+        // Without a limit a CLI that never returns — a network stall, a
+        // keychain prompt nobody answers — stopped every later poll.
+        let seconds = min(max(Shell.digits(Shell.setting(context.environment, "CLAUDE_USAGE_TIMEOUT"), default: 60), 1), 86_400)
+        let timeout = TimeInterval(seconds)
+
         // Ask whether the CLI is signed in before spending a `/usage` round
         // trip: a logged-out CLI prints no auth error there, just a cost
         // summary without limit lines, which would read as "the output format
         // changed". `auth status` is a local, offline check.
-        if let output = ChildProcess.captureOutput(
-            claude, ["auth", "status"], environment: context.environment, directory: directory
-        ) {
-            let status = Shell.trimmingTrailingNewlines(String(decoding: output, as: UTF8.self))
+        let auth = ChildProcess.captureOutput(
+            claude, ["auth", "status"], environment: context.environment, directory: directory, timeout: timeout
+        )
+        switch auth.outcome {
+        case .timedOut:
+            writeState(paths, "timed-out", "`claude auth status`가 \(seconds)초 안에 끝나지 않았습니다")
+            io.err("claude auth status timed out after \(seconds)s, keeping snapshot")
+            return 0
+        case .exited:
+            let status = Shell.trimmingTrailingNewlines(String(decoding: auth.output, as: UTF8.self))
             if !status.isEmpty, signedInState(status) == false {
                 writeState(paths, "signed-out", "터미널 claude가 로그아웃 상태입니다")
                 io.err("claude cli reports signed out, keeping snapshot")
                 return 0
             }
+        case .notStarted:
+            break
         }
 
         // --no-session-persistence keeps the 180s poll from leaving a throwaway
         // session file behind on every run (it once buried the real session
         // list under 314 stubs). No MCP servers or browser bridge are needed.
-        ChildProcess.runRedirectingOutput(
+        let query = ChildProcess.runRedirectingOutput(
             claude,
             ["-p", "/usage",
              "--no-session-persistence",
              "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}", "--no-chrome"],
             environment: context.environment,
             directory: directory,
-            to: paths.usageRaw
+            to: paths.usageRaw,
+            timeout: timeout
         )
+        if case .timedOut = query {
+            writeState(paths, "timed-out", "`/usage` 조회가 \(seconds)초 안에 끝나지 않았습니다")
+            io.err("usage query timed out after \(seconds)s, keeping snapshot")
+            return 0
+        }
 
         guard Shell.isNonEmpty(paths.usageRaw), let raw = Shell.readData(paths.usageRaw) else {
             writeState(paths, "empty-output", "/usage 출력이 비어 있습니다")

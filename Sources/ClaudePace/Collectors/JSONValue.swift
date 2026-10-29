@@ -494,25 +494,30 @@ struct JSONParseError: Error {
 
 /// A strict RFC 8259 parser over UTF-8 bytes that keeps key order and number
 /// literals. Invalid UTF-8 inside strings becomes U+FFFD, as in jq.
+///
+/// It reads the bytes where they are: the ledger summary parses up to 50 MB
+/// every minute, and a copy into an array would double that.
 struct JSONParser {
-    private let bytes: [UInt8]
+    private let bytes: UnsafeBufferPointer<UInt8>
     private var index = 0
     private var depth = 0
     /// Background threads have small stacks; real inputs nest a handful deep.
     private static let maximumDepth = 200
 
-    private init(bytes: [UInt8]) {
+    private init(bytes: UnsafeBufferPointer<UInt8>) {
         self.bytes = bytes
     }
 
     /// Exactly one value, optionally surrounded by whitespace.
     static func parse(_ data: Data) throws -> JSONValue {
-        var parser = JSONParser(bytes: [UInt8](data))
-        parser.skipWhitespace()
-        let value = try parser.parseValue()
-        parser.skipWhitespace()
-        guard parser.index == parser.bytes.count else { throw JSONParseError(offset: parser.index) }
-        return value
+        try data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) throws -> JSONValue in
+            var parser = JSONParser(bytes: raw.bindMemory(to: UInt8.self))
+            parser.skipWhitespace()
+            let value = try parser.parseValue()
+            parser.skipWhitespace()
+            guard parser.index == parser.bytes.count else { throw JSONParseError(offset: parser.index) }
+            return value
+        }
     }
 
     static func parse(_ text: String) throws -> JSONValue {
@@ -531,12 +536,14 @@ struct JSONParser {
     /// parsed. Returns false on a syntax error (values before it were
     /// already delivered).
     static func forEachValue(in data: Data, _ body: (JSONValue) -> Void) -> Bool {
-        var parser = JSONParser(bytes: [UInt8](data))
-        while true {
-            parser.skipWhitespace()
-            if parser.index >= parser.bytes.count { return true }
-            guard let value = try? parser.parseValue() else { return false }
-            body(value)
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Bool in
+            var parser = JSONParser(bytes: raw.bindMemory(to: UInt8.self))
+            while true {
+                parser.skipWhitespace()
+                if parser.index >= parser.bytes.count { return true }
+                guard let value = try? parser.parseValue() else { return false }
+                body(value)
+            }
         }
     }
 

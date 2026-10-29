@@ -82,9 +82,18 @@ enum SessionIngest {
         case .failure(let failure): return failure.status
         }
 
-        var seen = Set((Shell.readData(settings.seenPath).map { String(decoding: $0, as: UTF8.self) } ?? "")
-            .split(separator: "\n", omittingEmptySubsequences: true)
-            .map(String.init))
+        // Every event id ever ingested, one per line. The app runs this each
+        // minute and most runs find nothing new, so the list is only read
+        // once a candidate event turns up (still under the lock).
+        var seenIDs: Set<String>?
+        func isNew(_ id: String) -> Bool {
+            if seenIDs == nil {
+                seenIDs = Set((Shell.readData(settings.seenPath).map { String(decoding: $0, as: UTF8.self) } ?? "")
+                    .split(separator: "\n", omittingEmptySubsequences: true)
+                    .map(String.init))
+            }
+            return seenIDs?.contains(id) == false
+        }
 
         var scanned = 0
         for file in Shell.recentJSONLFiles(in: settings.sessionsDir, days: settings.days, now: Shell.nowSeconds()) {
@@ -96,17 +105,18 @@ enum SessionIngest {
             if offset > size { offset = 0 }
             if offset == size { continue }
 
-            for line in newLines(of: file, from: offset) where line.range(of: settings.needle) != nil {
-                guard let value = try? JSONParser.parse(line) else { continue }
+            forEachNewLine(of: file, from: offset) { line in
+                guard line.range(of: settings.needle) != nil,
+                      let value = try? JSONParser.parse(line) else { return }
                 let event: (id: String, record: JSONObject)?
                 switch source {
                 case .codex: event = codexEvent(value, file: file)
                 case .claude: event = claudeEvent(value, file: file)
                 }
-                guard let event, !seen.contains(event.id) else { continue }
+                guard let event, isNew(event.id) else { return }
                 Shell.append(JSONValue.object(event.record).compactText + "\n", to: paths.usageLog)
                 Shell.append(event.id + "\n", to: settings.seenPath)
-                seen.insert(event.id)
+                seenIDs?.insert(event.id)
             }
 
             Shell.overwrite(String(size), to: offsetPath)
@@ -122,29 +132,29 @@ enum SessionIngest {
         return 0
     }
 
-    /// `tail -c +$((offset + 1)) "$file"` split into lines. A final fragment
-    /// without a newline still counts as a line, as it does for grep.
-    private static func newLines(of file: String, from offset: Int) -> [Data] {
-        guard let handle = FileHandle(forReadingAtPath: file) else { return [] }
+    /// `tail -c +$((offset + 1)) "$file"`, one line at a time. A final
+    /// fragment without a newline still counts as a line, as it does for grep.
+    /// The file is read in pieces, so the first pass over a long session never
+    /// holds the whole tail (and a copy of it) in memory.
+    private static func forEachNewLine(of file: String, from offset: Int, _ body: (Data) -> Void) {
+        guard let handle = FileHandle(forReadingAtPath: file) else { return }
         defer { try? handle.close() }
         do {
             try handle.seek(toOffset: UInt64(offset))
         } catch {
-            return []
+            return
         }
-        let chunk = (try? handle.readToEnd()) ?? Data()
-        var lines: [Data] = []
-        var start = chunk.startIndex
-        while start < chunk.endIndex {
-            if let newline = chunk[start...].firstIndex(of: 0x0A) {
-                lines.append(chunk.subdata(in: start..<newline))
-                start = chunk.index(after: newline)
-            } else {
-                lines.append(chunk.subdata(in: start..<chunk.endIndex))
-                break
+        var pending = Data()
+        while let chunk = try? handle.read(upToCount: 1 << 20), !chunk.isEmpty {
+            pending.append(chunk)
+            var start = pending.startIndex
+            while let newline = pending[start...].firstIndex(of: 0x0A) {
+                body(pending[start..<newline])
+                start = pending.index(after: newline)
             }
+            pending = Data(pending[start...])
         }
-        return lines
+        if !pending.isEmpty { body(pending) }
     }
 
     /// `$(jq -r 'path // empty')`: jq's raw text of the value, or "".

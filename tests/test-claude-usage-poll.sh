@@ -18,12 +18,15 @@ cat > "$scratch/bin/claude" <<'FAKE'
 #!/bin/bash
 # `auth status` answers from FAKE_AUTH (default: signed in); anything else
 # replays the recorded /usage fixture. Records the argv of each call so a test
-# can assert that a signed-out CLI is never asked for /usage.
+# can assert that a signed-out CLI is never asked for /usage. FAKE_AUTH_SLEEP /
+# FAKE_USAGE_SLEEP make the matching call hang for that many seconds.
 printf '%s\n' "$*" >> "${FAKE_CALL_LOG:-/dev/null}"
 if [ "${1:-}" = "auth" ] && [ "${2:-}" = "status" ]; then
+  [ -n "${FAKE_AUTH_SLEEP:-}" ] && exec sleep "$FAKE_AUTH_SLEEP"
   printf '%s' "${FAKE_AUTH:-{\"loggedIn\": true, \"authMethod\": \"oauth\"\}}"
   exit 0
 fi
+[ -n "${FAKE_USAGE_SLEEP:-}" ] && exec sleep "$FAKE_USAGE_SLEEP"
 [ -n "${FAKE_USAGE_FILE:-}" ] && [ -f "$FAKE_USAGE_FILE" ] && cat "$FAKE_USAGE_FILE"
 exit 0
 FAKE
@@ -152,6 +155,39 @@ grep -q -- '--no-session-persistence' "$call_log" || {
   failures=$((failures + 1))
   echo "FAIL: signed-in: poll would leave a session file behind" >&2
 }
+
+# --- 9) a `/usage` call that never returns is stopped at the time limit: the
+# snapshot is kept and the cause named, instead of every later poll stalling
+before="$(cat "$appdir/snapshot.json")"
+started=$SECONDS
+HOME="$fake_home" PATH="$scratch/bin:$PATH" CLAUDE_USAGE_TIMEOUT=2 FAKE_USAGE_SLEEP=60 \
+  FAKE_USAGE_FILE="$scratch/full.txt" \
+  "$bin" poll-usage >/dev/null 2>&1 || true
+elapsed=$((SECONDS - started))
+check "usage timeout: snapshot untouched" "$before" "$(cat "$appdir/snapshot.json")"
+check "usage timeout: state" "timed-out" "$(field "$appdir/claude-collector-state.json" status)"
+[ "$elapsed" -lt 20 ] || { failures=$((failures + 1)); echo "FAIL: usage timeout: poll took ${elapsed}s" >&2; }
+
+# --- 10) the same for `auth status`, and /usage is then not attempted
+: > "$call_log"
+started=$SECONDS
+HOME="$fake_home" PATH="$scratch/bin:$PATH" CLAUDE_USAGE_TIMEOUT=2 FAKE_AUTH_SLEEP=60 \
+  FAKE_CALL_LOG="$call_log" FAKE_USAGE_FILE="$scratch/full.txt" \
+  "$bin" poll-usage >/dev/null 2>&1 || true
+elapsed=$((SECONDS - started))
+check "auth timeout: snapshot untouched" "$before" "$(cat "$appdir/snapshot.json")"
+check "auth timeout: state" "timed-out" "$(field "$appdir/claude-collector-state.json" status)"
+[ "$elapsed" -lt 20 ] || { failures=$((failures + 1)); echo "FAIL: auth timeout: poll took ${elapsed}s" >&2; }
+if grep -q -- '-p /usage' "$call_log"; then
+  failures=$((failures + 1))
+  echo "FAIL: auth timeout: /usage was still called" >&2
+fi
+
+# --- 11) a normal poll afterwards recovers
+HOME="$fake_home" PATH="$scratch/bin:$PATH" CLAUDE_USAGE_TIMEOUT=2 \
+  FAKE_USAGE_FILE="$scratch/full.txt" \
+  "$bin" poll-usage >/dev/null 2>&1 || true
+check "after timeout: state" "ok" "$(field "$appdir/claude-collector-state.json" status)"
 
 if [ "$failures" -ne 0 ]; then
   echo "FAIL: $failures claude-usage-poll assertions failed" >&2

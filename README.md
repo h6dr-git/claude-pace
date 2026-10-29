@@ -14,7 +14,7 @@ Claude·Codex 구독 한도(5시간·주간)를 지금 얼마나 썼는지, 언�
 
 ## 설계에서 정한 것
 - **틀린 숫자보다 빈칸**: 읽을 값이 없으면 링 대신 `?`. 0%로 그리지 않음. 퍼센트·리셋이 없거나 범위를 벗어난 값도 "읽을 값 없음"으로 처리.
-- **멈추면 이유를 표시**: 로그아웃·한도 줄 없음·해석 실패 같은 사유를 메뉴에 그대로 띄움. 마지막 값이 24시간 안이면 「⚠ 수집 중단」 구획과 함께 보여 줘서, 멈춘 숫자가 현재값처럼 읽히지 않게 함.
+- **멈추면 이유를 표시**: 로그아웃·한도 줄 없음·해석 실패·시간 초과 같은 사유를 메뉴에 그대로 띄움. `claude` 호출은 한 번에 60초까지만 기다려서, CLI가 멈춰도 다음 조회는 돎. 마지막 값이 24시간 안이면 「⚠ 수집 중단」 구획과 함께 보여 줘서, 멈춘 숫자가 현재값처럼 읽히지 않게 함.
 - **로그인 여부 선확인**: 로그아웃 상태의 `/usage`는 오류 없이 한도 줄만 빠진 출력을 냄. 그래서 조회 전에 `claude auth status`를 먼저 확인해 "출력 형식이 바뀐 것"으로 오진하지 않음.
 - **공급자 게이트**: 환경 변수 하나(`AI_USAGE_PRIMARY_PROVIDER`)가 정한 공급자만 수집. 값이 없거나 오타면 아무것도 수집하지 않음(fail-closed). 공급자를 바꿔도 이전 공급자의 폴링이 되살아나지 않음.
 - **기록은 지우지 않음**: 사용량 원장이 50MiB를 넘거나 월이 바뀌면 통째로 보관 폴더로 옮김. 옮기기 전에 모든 줄이 JSON인지 검사하고, 하나라도 깨져 있으면 회전 거부. 보관본은 수정·압축·삭제하지 않음.
@@ -74,17 +74,13 @@ AI_USAGE_PRIMARY_PROVIDER=claude .build/release/ClaudePace   # Codex는 codex
 `~/Library/Application Support/ClaudePace/` 아래:
 - `snapshot.json` — Claude 스냅샷. 모델별 주간 버킷은 `modelWindows`에 이름 그대로 들어가서 모델명이 바뀌어도 코드 수정 불필요
 - `codex-snapshot.json` — Codex 스냅샷
-- `claude-collector-state.json` — 마지막 수집 결과(`ok` · `signed-out` · `no-limits` · `cli-missing` · `empty-output` · `parse-failed`). 스키마가 다르거나 모르는 값이면 성공이 아니라 수집 차단으로 읽음
+- `claude-collector-state.json` — 마지막 수집 결과(`ok` · `signed-out` · `no-limits` · `cli-missing` · `empty-output` · `parse-failed` · `timed-out`). 스키마가 다르거나 모르는 값이면 성공이 아니라 수집 차단으로 읽음
 - `usage-log.jsonl` — 사용량 원장(`usage.v1`). 회전된 세그먼트와 색인(`.summary.json`)은 `archive/`
 - `usage-history-summary.json` — 60초마다 갱신되는 경량 요약(보관본은 다시 훑지 않고 색인만 합산)
-- `.debug/last-input.json` — statusLine이 마지막으로 받은 입력 원문(스키마 확인용)
+- `.debug/last-input.json` — statusLine이 마지막으로 받은 입력 원문(등록한 경우에만)
 
-### statusLine (선택)
-`~/.claude/settings.json`에 등록하면 Claude Code 터미널 화면 렌더마다 입력이 기록됨.
-```json
-"statusLine": { "type": "command", "command": "/Users/<사용자명>/claude-pace/.build/release/ClaudePace statusline" }
-```
-예전엔 여기로 한도가 들어왔지만, Claude Code 2.1.x부터 statusLine 입력에 `rate_limits`가 없고 데스크톱 앱은 statusLine을 렌더하지 않아(2026-08-20 실측) 지금은 기록만 남김. 한도는 `/usage` 조회가 담당.
+### statusLine — 지금은 등록하지 않는 걸 권장
+예전엔 Claude Code `statusLine`으로 한도가 들어왔지만, 2.1.x부터 statusLine 입력에 `rate_limits`가 없고 데스크톱 앱은 statusLine을 렌더하지 않음(2026-08-20 실측). 이 상태로 등록해 두면 터미널 화면을 그릴 때마다 `snapshot.json`이 빈 한도로 덮여, 다음 `/usage` 조회(최대 180초)까지 메뉴바가 `?`가 됨. 한도는 `/usage` 조회가 담당하므로 등록할 필요 없음. `statusline` 하위 명령은 예전 스크립트와 똑같이 동작하도록 남겨 둠.
 
 ## 구조
 - `Sources/ClaudePace/` — AppKit 메뉴바 앱, 서드파티 의존성 0
@@ -93,17 +89,17 @@ AI_USAGE_PRIMARY_PROVIDER=claude .build/release/ClaudePace   # Codex는 codex
 | 하위 명령 (`ClaudePace <명령>`) | 하는 일 | 예전 스크립트 |
 |---|---|---|
 | `statusline` | Claude Code `statusLine` 명령(표준 입력 JSON) | `bridge/statusline.sh` |
-| `poll-usage` | `claude -p "/usage"`로 한도를 읽어 스냅샷·수집 상태 기록(`CLAUDE_BIN`으로 실행 파일 지정 가능) | `tools/poll-usage.sh` |
+| `poll-usage` | `claude -p "/usage"`로 한도를 읽어 스냅샷·수집 상태 기록(`CLAUDE_BIN`으로 실행 파일, `CLAUDE_USAGE_TIMEOUT`으로 호출당 제한 시간(초, 기본 60) 지정 가능) | `tools/poll-usage.sh` |
 | `poll-codex-usage` | `codex app-server`를 잠깐 띄워 읽기 요청 2개만 보내고 바로 종료(모델 턴 없음) | `tools/poll-codex-usage.py` |
 | `ingest-codex-sessions` · `ingest-claude-sessions` | `~/.codex/sessions`·`~/.claude/projects` 세션 기록의 토큰 사용량을 원장 형식으로 정규화 | `tools/ingest-*-sessions.sh` |
 | `usage-log-rotate` · `usage-log-segment-summary` · `usage-history-summary` | 원장 회전·세그먼트 색인·경량 요약 | `tools/usage-log-*.sh` · `tools/usage-history-summary.sh` |
 | `usage-daily-deltas` · `usage-monthly-summary` | 일별·월별 보고서 | `tools/usage-daily-deltas.sh` · `tools/usage-monthly-summary.sh` |
 
-인자·환경 변수·출력·종료 코드는 예전 스크립트와 같음. 목록은 `ClaudePace help`.
+인자·환경 변수·출력·종료 코드는 예전 스크립트와 같음(더해진 것: 위 시간 제한). 모르는 명령이면 앱을 띄우지 않고 사용법을 출력한 뒤 64로 끝남. 목록은 `ClaudePace help`.
 
 ### 스크립트 버전에서 넘어올 때
 - `git pull` 후 `swift build -c release`로 다시 빌드. LaunchAgent는 실행 파일 경로만 맞으면 그대로 씀
-- statusLine을 등록해 뒀다면 명령을 `…/ClaudePace statusline`으로 바꿈(`bridge/statusline.sh`는 없어짐)
+- statusLine을 등록해 뒀다면 `~/.claude/settings.json`에서 빼는 걸 권장(위 「statusLine」 참고). 계속 쓸 거면 명령을 `…/ClaudePace statusline`으로 바꿈(`bridge/statusline.sh`는 없어짐)
 - 원장·오프셋·처리 기록은 그대로 이어 씀. 이벤트 id·파일 경로 규칙이 예전과 같아서 이미 넣은 기록을 다시 넣지 않음
 
 ## 겪은 문제
@@ -119,7 +115,8 @@ AI_USAGE_PRIMARY_PROVIDER=claude .build/release/ClaudePace   # Codex는 codex
 ## 테스트
 먼저 `swift build -c release`. 가짜 `claude`·`codex`를 PATH에 올려 실계정을 건드리지 않고 검증(테스트에는 `jq`·`python3` 필요). GitHub Actions(macOS)에서 커밋마다 전부 돌림.
 ```sh
-tests/test-claude-usage-poll.sh          # /usage 출력 형태별 동작, 로그아웃·빈 출력·CLI 부재에서 스냅샷 보존
+tests/test-cli.sh                        # 하위 명령 분기, 모르는 명령이면 앱을 띄우지 않고 64로 종료
+tests/test-claude-usage-poll.sh          # /usage 출력 형태별 동작, 로그아웃·빈 출력·CLI 부재·시간 초과에서 스냅샷 보존
 tests/test-usage-provider-selection.sh   # 공급자별 fail-closed, 0% 대신 "읽을 값 없음"
 tests/test-usage-log-rotation.sh         # 임계·월 경계 회전, 바이트·행 보존, 깨진 JSON 회전 거부
 tests/test-parity.sh                     # 예전 스크립트(git 이력)와 Swift 수집기를 같은 입력으로 돌려 결과 파일 대조

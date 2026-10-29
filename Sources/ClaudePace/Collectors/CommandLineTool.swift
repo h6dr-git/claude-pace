@@ -21,10 +21,13 @@ enum CommandLineTool {
       usage-monthly-summary [log] [YYYY-MM]
     """
 
-    /// The exit status, or nil when the arguments do not name a command (so
-    /// the caller starts the app; macOS may pass `-psn_…` and the like).
+    /// The exit status, or nil when ClaudePace should start as the menu bar
+    /// app: no arguments, or only what macOS and AppKit add at launch
+    /// (`-psn_…`, `-NSDocumentRevisionsDebugMode YES`, `-AppleLanguages …`).
+    /// Anything else that is not a command is a usage error (64) — a mistyped
+    /// statusLine command must not start another menu bar app on every render.
     static func run(_ arguments: [String]) -> Int32? {
-        guard let command = arguments.first else { return nil }
+        guard let command = arguments.first, !isLaunchArgument(command) else { return nil }
         let rest = Array(arguments.dropFirst())
         var environment = ProcessInfo.processInfo.environment
         let home = Shell.setting(environment, "HOME") ?? NSHomeDirectory()
@@ -96,7 +99,12 @@ enum CommandLineTool {
             return 0
 
         default:
-            return nil
+            CommandIO.console.err("ClaudePace: unknown command: \(command)\n\n\(usage)")
+            return 64
         }
+    }
+
+    private static func isLaunchArgument(_ argument: String) -> Bool {
+        argument.hasPrefix("-psn_") || argument.hasPrefix("-NS") || argument.hasPrefix("-Apple")
     }
 }
