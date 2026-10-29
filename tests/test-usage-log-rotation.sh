@@ -3,6 +3,8 @@
 set -u
 
 repo_dir=$(cd "$(dirname "$0")/.." && pwd)
+bin="${CLAUDE_PACE_BIN:-$repo_dir/.build/release/ClaudePace}"
+[ -x "$bin" ] || { echo "build first: swift build -c release (or set CLAUDE_PACE_BIN)" >&2; exit 1; }
 test_root="${1:-$(mktemp -d "${TMPDIR:-/tmp}/claudepace-rotation-test.XXXXXX")}"
 
 fail() {
@@ -34,7 +36,7 @@ before_lines=$(wc -l < "$fixture_log" | tr -d ' ')
 before_inode=$(stat -f '%i' "$fixture_log")
 
 rotation_output=$(HOME="$fixture_home" USAGE_LOG_MAX_BYTES=1 USAGE_LOG_CURRENT_PERIOD=2026-08 \
-  /bin/bash "$repo_dir/tools/usage-log-rotate.sh" "$fixture_log") || fail "threshold rotation"
+  "$bin" usage-log-rotate "$fixture_log") || fail "threshold rotation"
 archive_log="$fixture_app/archive/usage-log-2026-08-001.jsonl"
 archive_summary="${archive_log%.jsonl}.summary.json"
 
@@ -52,7 +54,7 @@ assert_eq "3" "$(jq -r '.lines' "$archive_summary")" "segment JSON lines"
 # App summary must work while the archived JSONL is unreadable: it may stat the
 # inode, but it must consume the precomputed summary rather than open the data.
 chmod 000 "$archive_log"
-light_summary=$(HOME="$fixture_home" "$repo_dir/tools/usage-history-summary.sh" "$fixture_log") || fail "light summary"
+light_summary=$(HOME="$fixture_home" "$bin" usage-history-summary "$fixture_log") || fail "light summary"
 chmod 600 "$archive_log"
 assert_eq "3" "$(printf '%s\n' "$light_summary" | jq -r '.records')" "light archive records"
 assert_eq "2" "$(printf '%s\n' "$light_summary" | jq -r '.bySource[] | select(.source == "codex-session") | .count')" "light Codex count"
@@ -60,11 +62,11 @@ assert_eq "2" "$(printf '%s\n' "$light_summary" | jq -r '.bySource[] | select(.s
 printf '%s\n' \
   '{"schema":"usage.v1","source":"claude-session","event_id":"h2","timestamp":"2026-08-10T00:30:00Z","tokenUsage":{"input_tokens":1,"output_tokens":1},"rateLimits":null,"sourcePath":"session-h"}' \
   >> "$fixture_log"
-light_summary=$(HOME="$fixture_home" "$repo_dir/tools/usage-history-summary.sh" "$fixture_log") || fail "combined light summary"
+light_summary=$(HOME="$fixture_home" "$bin" usage-history-summary "$fixture_log") || fail "combined light summary"
 assert_eq "4" "$(printf '%s\n' "$light_summary" | jq -r '.records')" "combined records"
 
-monthly=$(HOME="$fixture_home" "$repo_dir/tools/usage-monthly-summary.sh" "$fixture_log" 2026-08) || fail "monthly report"
-daily=$(HOME="$fixture_home" "$repo_dir/tools/usage-daily-deltas.sh" "$fixture_log") || fail "daily report"
+monthly=$(HOME="$fixture_home" "$bin" usage-monthly-summary "$fixture_log" 2026-08) || fail "monthly report"
+daily=$(HOME="$fixture_home" "$bin" usage-daily-deltas "$fixture_log") || fail "daily report"
 assert_eq "4" "$(printf '%s\n' "$monthly" | jq -r '.counts.totalEvents')" "monthly archived records"
 assert_eq "60" "$(printf '%s\n' "$monthly" | jq -r '.codexObservedDelta.total_tokens')" "monthly archived delta"
 assert_eq "2" "$(printf '%s\n' "$daily" | jq -r '.days[0].eventCount')" "daily archived events"
@@ -79,7 +81,7 @@ mkdir -p "$month_app"
 printf '%s\n' '{"schema":"usage.v1","source":"claude-statusline","event_id":"m1","timestamp":"2026-07-31T14:59:00Z"}' > "$month_log"
 printf '%s\n' '2026-07' > "$month_app/.usage-log-active-period"
 HOME="$month_home" USAGE_LOG_MAX_BYTES=999999 USAGE_LOG_CURRENT_PERIOD=2026-08 \
-  /bin/bash "$repo_dir/tools/usage-log-rotate.sh" "$month_log" >/dev/null || fail "month rotation"
+  "$bin" usage-log-rotate "$month_log" >/dev/null || fail "month rotation"
 [ -f "$month_app/archive/usage-log-2026-07-001.jsonl" ] || fail "month archive name"
 
 # The 60-second Codex adapter performs automatic checks before and after its
@@ -92,8 +94,8 @@ printf '%s\n' '{"schema":"usage.v1","source":"claude-statusline","event_id":"see
 printf '%s\n' '{"timestamp":"2026-08-10T01:01:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0,"total_tokens":12},"last_token_usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0,"total_tokens":12},"model_context_window":1000},"rate_limits":null}}' > "$sessions_dir/session.jsonl"
 HOME="$ingest_home" CODEX_SESSIONS_DIR="$sessions_dir" CODEX_USAGE_MTIME_DAYS=2 \
   USAGE_LOG_MAX_BYTES=1 USAGE_LOG_CURRENT_PERIOD=2026-08 \
-  "$repo_dir/tools/ingest-codex-sessions.sh" >/dev/null || fail "automatic ingest rotation"
-ingest_summary=$(HOME="$ingest_home" "$repo_dir/tools/usage-history-summary.sh" "$ingest_app/usage-log.jsonl") || fail "ingest aggregate"
+  "$bin" ingest-codex-sessions >/dev/null || fail "automatic ingest rotation"
+ingest_summary=$(HOME="$ingest_home" "$bin" usage-history-summary "$ingest_app/usage-log.jsonl") || fail "ingest aggregate"
 assert_eq "2" "$(printf '%s\n' "$ingest_summary" | jq -r '.records')" "ingest preserved records"
 assert_eq "2" "$(find "$ingest_app/archive" -type f -name 'usage-log-*.jsonl' | wc -l | tr -d ' ')" "pre/post ingest segments"
 
@@ -105,7 +107,7 @@ mkdir -p "$invalid_app"
 printf '%s\n' '{"source":"codex-session"}' 'not-json' > "$invalid_log"
 invalid_hash=$(shasum -a 256 "$invalid_log" | awk '{print $1}')
 if HOME="$invalid_home" USAGE_LOG_MAX_BYTES=1 USAGE_LOG_CURRENT_PERIOD=2026-08 \
-  /bin/bash "$repo_dir/tools/usage-log-rotate.sh" "$invalid_log" >/dev/null 2>&1; then
+  "$bin" usage-log-rotate "$invalid_log" >/dev/null 2>&1; then
   fail "invalid JSON rotation should fail"
 fi
 assert_eq "$invalid_hash" "$(shasum -a 256 "$invalid_log" | awk '{print $1}')" "invalid source retained"

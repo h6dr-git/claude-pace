@@ -1,10 +1,12 @@
 #!/bin/bash
-# Isolated regression for tools/poll-usage.sh. A fake `claude` on PATH replays
-# recorded `/usage` shapes into a throwaway HOME, so no account is queried and
-# the real snapshot is never touched.
+# Isolated regression for `ClaudePace poll-usage` (formerly tools/poll-usage.sh).
+# A fake `claude` on PATH replays recorded `/usage` shapes into a throwaway
+# HOME, so no account is queried and the real snapshot is never touched.
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
+bin="${CLAUDE_PACE_BIN:-$repo_dir/.build/release/ClaudePace}"
+[ -x "$bin" ] || { echo "build first: swift build -c release (or set CLAUDE_PACE_BIN)" >&2; exit 1; }
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/ai-usage-poll-test.XXXXXX")"
 trap 'rm -rf "$scratch"' EXIT
 
@@ -38,7 +40,7 @@ check() {
 
 run_poll() {
   HOME="$fake_home" PATH="$scratch/bin:$PATH" FAKE_USAGE_FILE="${1:-}" \
-    bash "$repo_dir/tools/poll-usage.sh" >/dev/null 2>&1 || true
+    "$bin" poll-usage >/dev/null 2>&1 || true
 }
 
 field() { python3 -c "
@@ -117,7 +119,7 @@ check "week-only: state" "ok" "$(field "$appdir/claude-collector-state.json" sta
 
 # --- 6) claude missing entirely
 HOME="$fake_home" CLAUDE_BIN="$scratch/no-such-claude" \
-  bash "$repo_dir/tools/poll-usage.sh" >/dev/null 2>&1 || true
+  "$bin" poll-usage >/dev/null 2>&1 || true
 check "cli-missing: state" "cli-missing" "$(field "$appdir/claude-collector-state.json" status)"
 
 # --- 7) CLI reports signed out: named exactly, and /usage is never called
@@ -126,7 +128,7 @@ call_log="$scratch/calls.txt"
 HOME="$fake_home" PATH="$scratch/bin:$PATH" FAKE_CALL_LOG="$call_log" \
   FAKE_AUTH='{"loggedIn": false, "authMethod": "none"}' \
   FAKE_USAGE_FILE="$scratch/full.txt" \
-  bash "$repo_dir/tools/poll-usage.sh" >/dev/null 2>&1 || true
+  "$bin" poll-usage >/dev/null 2>&1 || true
 check "signed-out precheck: state" "signed-out" "$(field "$appdir/claude-collector-state.json" status)"
 if grep -q -- '-p /usage' "$call_log"; then
   failures=$((failures + 1))
@@ -137,7 +139,7 @@ fi
 : > "$call_log"
 HOME="$fake_home" PATH="$scratch/bin:$PATH" FAKE_CALL_LOG="$call_log" \
   FAKE_USAGE_FILE="$scratch/full.txt" \
-  bash "$repo_dir/tools/poll-usage.sh" >/dev/null 2>&1 || true
+  "$bin" poll-usage >/dev/null 2>&1 || true
 check "signed-in: state" "ok" "$(field "$appdir/claude-collector-state.json" status)"
 grep -q -- '-p /usage' "$call_log" || {
   failures=$((failures + 1))

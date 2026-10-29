@@ -1,6 +1,6 @@
 import Foundation
 
-// MARK: - Claude snapshot (matches what bridge/statusline.sh and tools/poll-usage.sh write)
+// MARK: - Claude snapshot (matches what StatusLineBridge and ClaudeUsageCollector write)
 
 struct RLWindow: Codable {
     let used_percentage: Double?
@@ -66,7 +66,7 @@ struct Snapshot: Codable {
 // MARK: - Collector state
 
 /// Why the Claude collector last succeeded or failed. Written by
-/// `tools/poll-usage.sh` on every poll so a silent collector failure (an expired
+/// `ClaudeUsageCollector` on every poll so a silent collector failure (an expired
 /// CLI login, a `/usage` output that no longer prints limits) shows up in the
 /// menu instead of looking like "no usage yet".
 enum ClaudeCollectorStatus: Equatable {

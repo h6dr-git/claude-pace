@@ -24,14 +24,10 @@ final class CodexUsagePoller {
     static let shared = CodexUsagePoller()
 
     private let queue = DispatchQueue(label: "ClaudePace.CodexUsagePoller")
-    private let scriptURL: URL
     private var lastAttempt = Date.distantPast
     private var running = false
 
-    private init() {
-        scriptURL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Developer/claude-pace/tools/poll-codex-usage.py")
-    }
+    private init() {}
 
     func refreshIfDue(
         interval: TimeInterval = 180,
@@ -41,36 +37,21 @@ final class CodexUsagePoller {
         queue.async {
             guard !self.running else { return }
             guard force || Date().timeIntervalSince(self.lastAttempt) >= interval else { return }
-            guard FileManager.default.isExecutableFile(atPath: self.scriptURL.path) else {
-                DispatchQueue.main.async { completion?(false) }
-                return
-            }
 
             self.running = true
             self.lastAttempt = Date()
 
-            let process = Process()
-            process.executableURL = self.scriptURL
-            process.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(".claudepace/cwd")
-            process.environment = [
-                "HOME": FileManager.default.homeDirectoryForCurrentUser.path,
-                "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-            ]
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
-
-            var succeeded = false
-            do {
-                try process.run()
-                process.waitUntilExit()
-                succeeded = process.terminationStatus == 0
-            } catch {
-                succeeded = false
-            }
+            let home = FileManager.default.homeDirectoryForCurrentUser.path
+            let context = CodexUsageCollector.Context(
+                home: home,
+                environment: ["HOME": home, "PATH": CollectorEnvironment.appSearchPath],
+                searchPath: CollectorEnvironment.appSearchPath,
+                codexBin: nil
+            )
+            let status = CodexUsageCollector.poll(context, io: .silent)
 
             self.running = false
-            DispatchQueue.main.async { completion?(succeeded) }
+            DispatchQueue.main.async { completion?(status == 0) }
         }
     }
 }

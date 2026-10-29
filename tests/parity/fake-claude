@@ -1,0 +1,11 @@
+#!/bin/bash
+# Stand-in for the `claude` CLI. `auth status` answers from FAKE_AUTH (default:
+# signed in); anything else replays FAKE_USAGE_FILE. Every call's argv is
+# appended to FAKE_CALL_LOG.
+printf '%s\n' "$*" >> "${FAKE_CALL_LOG:-/dev/null}"
+if [ "${1:-}" = "auth" ] && [ "${2:-}" = "status" ]; then
+  printf '%s' "${FAKE_AUTH:-{\"loggedIn\": true, \"authMethod\": \"oauth\"\}}"
+  exit 0
+fi
+[ -n "${FAKE_USAGE_FILE:-}" ] && [ -f "$FAKE_USAGE_FILE" ] && cat "$FAKE_USAGE_FILE"
+exit 0

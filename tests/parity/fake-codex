@@ -1,0 +1,36 @@
+#!/bin/bash
+# Stand-in for `codex app-server`. FAKE_CODEX_MODE picks the behaviour
+# (ok, usage-error, rate-error, slow-init); every request line is appended to
+# FAKE_CODEX_INPUT so the exact bytes a poller sends can be compared.
+[ "${1:-}" = "app-server" ] || exit 2
+mode="${FAKE_CODEX_MODE:-ok}"
+
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "${FAKE_CODEX_INPUT:-/dev/null}"
+  case "$line" in
+    *'"method":"initialize"'*)
+      if [ "$mode" = slow-init ]; then
+        sleep 7
+        continue
+      fi
+      printf '%s\n' '{"method":"server/notice","params":{"text":"hello"}}'
+      printf '%s\n' '{"id":0,"result":{"userAgent":"codex-fake/1.0","platformFamily":"unix","platformOs":"macos","extra":true}}'
+      ;;
+    *'"method":"account/rateLimits/read"'*)
+      if [ "$mode" = rate-error ]; then
+        printf '%s\n' '{"id":1,"error":{"code":-32000,"message":"rate limits unavailable"}}'
+        continue
+      fi
+      printf '%s\n' 'not json at all'
+      printf '%s\n' '{"id":1.0,"result":{"ignored":"float ids are not ids"}}'
+      printf '%s\n' '{"id":1,"result":{"rateLimits":{"limitId":"codex","limitName":null,"primary":{"usedPercent":42.0,"windowDurationMins":300,"resetsAt":1893456000},"secondary":{"usedPercent":7.5,"windowDurationMins":10080,"resetsAt":1894000000},"credits":{"hasCredits":false,"unlimited":false,"balance":"0"},"planType":"pro","rateLimitReachedType":null},"rateLimitsByLimitId":{"codex":{"limitId":"codex","primary":{"usedPercent":42.0,"windowDurationMins":300,"resetsAt":1893456000}},"gpt-5-codex-mini":{"limitId":"gpt-5-codex-mini","limitName":"미니 모델","primary":{"usedPercent":3,"windowDurationMins":300,"resetsAt":1893456000}}},"rateLimitResetCredits":{"availableCount":2}}}'
+      ;;
+    *'"method":"account/usage/read"'*)
+      if [ "$mode" = usage-error ]; then
+        printf '%s\n' '{"id":2,"error":{"code":-32001,"message":"usage unavailable"}}'
+        continue
+      fi
+      printf '%s\n' '{"id":2,"result":{"summary":{"lifetimeTokens":123456,"peakDailyTokens":7890,"longestRunningTurnSec":61,"currentStreakDays":3,"longestStreakDays":9},"dailyUsageBuckets":[{"startDate":"2026-10-28","tokens":100}]}}'
+      ;;
+  esac
+done

@@ -9,17 +9,16 @@ jobs:
   macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
+          # The parity check reads the pre-port scripts from history.
           fetch-depth: 0
 
       - name: toolchain
         run: |
           sw_vers
           swift --version
-          echo "bash: $BASH_VERSION"
-          command -v jq python3 shasum lockf || true
-          jq --version || true
+          echo "::notice title=toolchain::macOS $(sw_vers -productVersion) · $(swift --version 2>&1 | head -1) · $(jq --version 2>&1) · $(python3 --version 2>&1) · bash $BASH_VERSION"
 
       - name: build
         run: .github/scripts/run-step.sh "swift build" swift build -c release
@@ -32,3 +31,6 @@ jobs:
 
       - name: usage log rotation tests
         run: .github/scripts/run-step.sh "usage log rotation tests" bash tests/test-usage-log-rotation.sh
+
+      - name: parity with the pre-port scripts
+        run: .github/scripts/run-step.sh "parity" bash tests/test-parity.sh

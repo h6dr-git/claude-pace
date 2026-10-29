@@ -1,0 +1,301 @@
+import Foundation
+
+/// Appends token usage from local CLI session logs to the normalized usage
+/// ledger (formerly tools/ingest-codex-sessions.sh and
+/// tools/ingest-claude-sessions.sh). Local only: reads ~/.codex/sessions or
+/// ~/.claude/projects and writes Application Support.
+///
+/// Per-file byte offsets plus a list of seen event ids keep it incremental and
+/// idempotent. Event ids are hashes of the session file path and of jq's text
+/// form of a few fields, so they come out identical to the ones the scripts
+/// already wrote — switching over does not re-ingest anything.
+enum SessionIngest {
+    enum Source {
+        /// Codex `token_count` events: cumulative and last-turn totals.
+        case codex
+        /// Claude Code / Agent SDK assistant turns (terminal CLI, Agent
+        /// Client/ACP, SDK subagents). The statusLine bridge only sees the
+        /// terminal TUI, so this is the token-usage axis for everything else.
+        case claude
+    }
+
+    private struct Settings {
+        let sessionsDir: String
+        let seenPath: String
+        let offsetDir: String
+        let days: Int
+        let needle: Data
+        let missingMessage: String
+    }
+
+    private static func makeSettings(_ source: Source, paths: AppPaths, environment: [String: String]) -> Settings {
+        switch source {
+        case .codex:
+            let dir = Shell.setting(environment, "CODEX_SESSIONS_DIR") ?? paths.home + "/.codex/sessions"
+            return Settings(
+                sessionsDir: dir,
+                seenPath: paths.appDir + "/.codex-usage-seen",
+                offsetDir: paths.appDir + "/.codex-offsets",
+                days: Shell.digits(Shell.setting(environment, "CODEX_USAGE_MTIME_DAYS"), default: 2),
+                needle: Data("\"type\":\"token_count\"".utf8),
+                missingMessage: "codex sessions dir missing: \(dir)"
+            )
+        case .claude:
+            let dir = Shell.setting(environment, "CLAUDE_PROJECTS_DIR") ?? paths.home + "/.claude/projects"
+            return Settings(
+                sessionsDir: dir,
+                seenPath: paths.appDir + "/.claude-session-seen",
+                offsetDir: paths.appDir + "/.claude-session-offsets",
+                days: Shell.digits(Shell.setting(environment, "CLAUDE_USAGE_MTIME_DAYS"), default: 2),
+                needle: Data("\"type\":\"assistant\"".utf8),
+                missingMessage: "claude projects dir missing: \(dir)"
+            )
+        }
+    }
+
+    static func run(_ source: Source, home: String, environment: [String: String], io: CommandIO) -> Int32 {
+        let paths = AppPaths(home: home)
+        let settings = makeSettings(source, paths: paths, environment: environment)
+        let files = UsageLogFiles(log: paths.usageLog)
+
+        Shell.makeDirectories(paths.appDir)
+        Shell.makeDirectories(settings.offsetDir)
+        Shell.touch(paths.usageLog)
+        Shell.touch(settings.seenPath)
+
+        guard Shell.isDirectory(settings.sessionsDir) else {
+            io.err(settings.missingMessage)
+            return 0
+        }
+        let timeout = Shell.digits(Shell.setting(environment, "USAGE_LOG_LOCK_TIMEOUT"), default: 120)
+
+        // The app runs this every 60 seconds. Rotate both before and after, so
+        // an already-large ledger and a batch that crosses the limit are both
+        // handled in the same pass.
+        if UsageLogRotation.rotate(paths.usageLog, environment: environment, io: io.droppingOutput) != 0 {
+            io.err("usage-log rotation check failed; continuing without discarding source events")
+        }
+
+        let lock: FileLock
+        switch files.lock(timeoutSeconds: timeout, io: io) {
+        case .success(let acquired): lock = acquired
+        case .failure(let failure): return failure.status
+        }
+
+        var seen = Set((Shell.readData(settings.seenPath).map { String(decoding: $0, as: UTF8.self) } ?? "")
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map(String.init))
+
+        var scanned = 0
+        for file in Shell.recentJSONLFiles(in: settings.sessionsDir, days: settings.days, now: Shell.nowSeconds()) {
+            guard Shell.isRegularFile(file), let size = Shell.fileSize(file) else { continue }
+            scanned += 1
+
+            let offsetPath = settings.offsetDir + "/" + Shell.sha256Hex(file) + ".offset"
+            var offset = Shell.digits(Shell.readText(offsetPath), default: 0)
+            if offset > size { offset = 0 }
+            if offset == size { continue }
+
+            for line in newLines(of: file, from: offset) where line.range(of: settings.needle) != nil {
+                guard let value = try? JSONParser.parse(line) else { continue }
+                let event: (id: String, record: JSONObject)?
+                switch source {
+                case .codex: event = codexEvent(value, file: file)
+                case .claude: event = claudeEvent(value, file: file)
+                }
+                guard let event, !seen.contains(event.id) else { continue }
+                Shell.append(JSONValue.object(event.record).compactText + "\n", to: paths.usageLog)
+                Shell.append(event.id + "\n", to: settings.seenPath)
+                seen.insert(event.id)
+            }
+
+            Shell.overwrite(String(size), to: offsetPath)
+        }
+
+        lock.release()
+
+        if UsageLogRotation.rotate(paths.usageLog, environment: environment, io: io.droppingOutput) != 0 {
+            io.err("post-ingest usage-log rotation check failed")
+        }
+
+        io.out("scanned_files=\(scanned) history=\(paths.usageLog)")
+        return 0
+    }
+
+    /// `tail -c +$((offset + 1)) "$file"` split into lines. A final fragment
+    /// without a newline still counts as a line, as it does for grep.
+    private static func newLines(of file: String, from offset: Int) -> [Data] {
+        guard let handle = FileHandle(forReadingAtPath: file) else { return [] }
+        defer { try? handle.close() }
+        do {
+            try handle.seek(toOffset: UInt64(offset))
+        } catch {
+            return []
+        }
+        let chunk = (try? handle.readToEnd()) ?? Data()
+        var lines: [Data] = []
+        var start = chunk.startIndex
+        while start < chunk.endIndex {
+            if let newline = chunk[start...].firstIndex(of: 0x0A) {
+                lines.append(chunk.subdata(in: start..<newline))
+                start = chunk.index(after: newline)
+            } else {
+                lines.append(chunk.subdata(in: start..<chunk.endIndex))
+                break
+            }
+        }
+        return lines
+    }
+
+    /// `$(jq -r 'path // empty')`: jq's raw text of the value, or "".
+    private static func rawText(_ value: JSONValue, _ path: [String]) -> String {
+        guard let found = value.jqValue(path) else { return "" }
+        return Shell.trimmingTrailingNewlines(found.jqRawText)
+    }
+
+    /// `(((.timestamp // "") | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601?) // null)`
+    private static func capturedAt(_ value: JSONValue) -> JSONValue {
+        guard case .string(let stamp) = value.jqValue(["timestamp"], or: .string("")),
+              let seconds = JQTime.fromISO8601(JQTime.droppingFractionalSeconds(stamp)) else {
+            return .null
+        }
+        return .int(seconds)
+    }
+
+    private static func codexEvent(_ value: JSONValue, file: String) -> (id: String, record: JSONObject)? {
+        let timestamp = rawText(value, ["timestamp"])
+        guard !timestamp.isEmpty else { return nil }
+        let total = rawText(value, ["payload", "info", "total_token_usage", "total_tokens"])
+        let last = rawText(value, ["payload", "info", "last_token_usage", "total_tokens"])
+        let id = "codex-session:" + Shell.sha256Hex("\(file):\(timestamp):\(total):\(last)")
+
+        var record = JSONObject()
+        record["schema"] = JSONValue.string("usage.v1")
+        record["source"] = JSONValue.string("codex-session")
+        record["event_id"] = JSONValue.string(id)
+        record["capturedAt"] = capturedAt(value)
+        record["timestamp"] = value.jqValue(["timestamp"], or: .null)
+        record["model"] = JSONValue.null
+        record["modelContextWindow"] = value.jqValue(["payload", "info", "model_context_window"], or: .null)
+        record["tokenUsage"] = JSONValue.object(JSONObject([
+            "total": value.jqValue(["payload", "info", "total_token_usage"], or: .null),
+            "last": value.jqValue(["payload", "info", "last_token_usage"], or: .null)
+        ]))
+        record["rateLimits"] = value.jqValue(["payload", "rate_limits"], or: .null)
+        record["sourcePath"] = JSONValue.string(file)
+        return (id, record)
+    }
+
+    private static func claudeEvent(_ value: JSONValue, file: String) -> (id: String, record: JSONObject)? {
+        // jq -e '.message.usage != null and (.message.usage.output_tokens != null)'
+        guard let usage = value.jqPath(["message", "usage"]) else { return nil }
+        if case .null = usage { return nil }
+        guard let outputTokens = usage.jqField("output_tokens") else { return nil }
+        if case .null = outputTokens { return nil }
+
+        // requestId is unique per API call, so it is the dedupe key; fall back
+        // to message.id, then the timestamp:
+        // (.requestId // .message.id // .timestamp // empty)
+        let requestValue = value.jqValue(["requestId"])
+            ?? value.jqValue(["message", "id"])
+            ?? value.jqValue(["timestamp"])
+        let requestID = requestValue.map { Shell.trimmingTrailingNewlines($0.jqRawText) } ?? ""
+        let timestamp = rawText(value, ["timestamp"])
+        guard !requestID.isEmpty, !timestamp.isEmpty else { return nil }
+        let id = "claude-session:" + Shell.sha256Hex("\(file):\(requestID)")
+
+        func tokens(_ key: String) -> JSONValue {
+            value.jqValue(["message", "usage", key], or: .int(0))
+        }
+        var record = JSONObject()
+        record["schema"] = JSONValue.string("usage.v1")
+        record["source"] = JSONValue.string("claude-session")
+        record["event_id"] = JSONValue.string(id)
+        record["capturedAt"] = capturedAt(value)
+        record["timestamp"] = value.jqValue(["timestamp"], or: .null)
+        record["model"] = value.jqValue(["message", "model"], or: .null)
+        record["entrypoint"] = value.jqValue(["entrypoint"], or: .null)
+        record["tokenUsage"] = JSONValue.object(JSONObject([
+            "input_tokens": tokens("input_tokens"),
+            "output_tokens": tokens("output_tokens"),
+            "cache_creation_input_tokens": tokens("cache_creation_input_tokens"),
+            "cache_read_input_tokens": tokens("cache_read_input_tokens")
+        ]))
+        record["rateLimits"] = JSONValue.null
+        record["sourcePath"] = JSONValue.string(file)
+        return (id, record)
+    }
+}
+
+/// jq's date helpers as the ingest scripts used them.
+enum JQTime {
+    /// `sub("\\.[0-9]+Z$"; "Z")`: drop fractional seconds before a final Z.
+    static func droppingFractionalSeconds(_ stamp: String) -> String {
+        var scalars = Array(stamp.unicodeScalars)
+        // `$` also matches just before one final newline.
+        var tail: [Unicode.Scalar] = []
+        if scalars.last == "\n" {
+            tail = [scalars.removeLast()]
+        }
+        guard scalars.last == "Z" else { return stamp }
+        let digits: ClosedRange<Unicode.Scalar> = "0"..."9"
+        var index = scalars.count - 2
+        while index >= 0, digits.contains(scalars[index]) { index -= 1 }
+        guard index >= 0, index < scalars.count - 2, scalars[index] == "." else { return stamp }
+        var result = String.UnicodeScalarView()
+        result.append(contentsOf: scalars[0..<index])
+        result.append("Z")
+        result.append(contentsOf: tail)
+        return String(result)
+    }
+
+    /// `fromdateiso8601`: strptime("%Y-%m-%dT%H:%M:%SZ") | mktime, with the
+    /// field rules of the macOS (BSD) strptime jq calls. nil = no match.
+    static func fromISO8601(_ text: String) -> Int? {
+        let bytes = Array(text.utf8)
+        var index = 0
+
+        func number(maxDigits: Int) -> Int? {
+            guard index < bytes.count, bytes[index] >= 0x30, bytes[index] <= 0x39 else { return nil }
+            var value = 0
+            var count = 0
+            while count < maxDigits, index < bytes.count, bytes[index] >= 0x30, bytes[index] <= 0x39 {
+                value = value * 10 + Int(bytes[index] - 0x30)
+                index += 1
+                count += 1
+            }
+            return value
+        }
+        func literal(_ byte: UInt8) -> Bool {
+            guard index < bytes.count, bytes[index] == byte else { return false }
+            index += 1
+            return true
+        }
+
+        guard let year = number(maxDigits: 4), literal(UInt8(ascii: "-")),
+              let month = number(maxDigits: 2), (1...12).contains(month), literal(UInt8(ascii: "-")),
+              let day = number(maxDigits: 2), day <= 31, literal(UInt8(ascii: "T")),
+              let hour = number(maxDigits: 2), hour <= 23, literal(UInt8(ascii: ":")),
+              let minute = number(maxDigits: 2), minute <= 59, literal(UInt8(ascii: ":")),
+              let second = number(maxDigits: 2), second <= 60, literal(UInt8(ascii: "Z")) else { return nil }
+        // jq accepts trailing whitespace after the format, nothing else.
+        if index < bytes.count {
+            let next = bytes[index]
+            guard next == 0x20 || (0x09...0x0D).contains(next) else { return nil }
+        }
+        // timegm, which normalizes out-of-range days (Feb 31 -> Mar 3).
+        let days = daysFromCivil(year: year, month: month, day: 1) + (day - 1)
+        return days * 86_400 + hour * 3600 + minute * 60 + second
+    }
+
+    /// Days since 1970-01-01 for a proleptic Gregorian date.
+    private static func daysFromCivil(year: Int, month: Int, day: Int) -> Int {
+        let y = month <= 2 ? year - 1 : year
+        let era = (y >= 0 ? y : y - 399) / 400
+        let yearOfEra = y - era * 400
+        let monthIndex = month > 2 ? month - 3 : month + 9
+        let dayOfYear = (153 * monthIndex + 2) / 5 + day - 1
+        let dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear
+        return era * 146_097 + dayOfEra - 719_468
+    }
+}
