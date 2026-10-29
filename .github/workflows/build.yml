@@ -32,6 +32,9 @@ jobs:
       - name: claude usage poll tests
         run: .github/scripts/run-step.sh "claude usage poll tests" bash tests/test-claude-usage-poll.sh
 
+      - name: session ingest tests
+        run: .github/scripts/run-step.sh "session ingest tests" bash tests/test-session-ingest.sh
+
       - name: usage log rotation tests
         run: .github/scripts/run-step.sh "usage log rotation tests" bash tests/test-usage-log-rotation.sh
 

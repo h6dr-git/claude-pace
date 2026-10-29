@@ -6,7 +6,8 @@ import Foundation
 /// ~/.claude/projects and writes Application Support.
 ///
 /// Per-file byte offsets plus a list of seen event ids keep it incremental and
-/// idempotent. Event ids are hashes of the session file path and of jq's text
+/// idempotent. An offset never moves past a last line that is still being
+/// written. Event ids are hashes of the session file path and of jq's text
 /// form of a few fields, so they come out identical to the ones the scripts
 /// already wrote — switching over does not re-ingest anything.
 enum SessionIngest {
@@ -105,7 +106,7 @@ enum SessionIngest {
             if offset > size { offset = 0 }
             if offset == size { continue }
 
-            forEachNewLine(of: file, from: offset) { line in
+            func ingest(_ line: Data) {
                 guard line.range(of: settings.needle) != nil,
                       let value = try? JSONParser.parse(line) else { return }
                 let event: (id: String, record: JSONObject)?
@@ -119,7 +120,20 @@ enum SessionIngest {
                 seenIDs?.insert(event.id)
             }
 
-            Shell.overwrite(String(size), to: offsetPath)
+            // The scripts stored the size as the next offset even when the
+            // file ended inside a line the CLI was still writing; the rest
+            // of that line was then read on its own next time, and the event
+            // was lost. A last line that is not complete JSON yet is now left
+            // to be read again, whole, on the next run.
+            var nextOffset = size
+            if let tail = readLines(of: file, from: offset, ingest) {
+                if (try? JSONParser.parse(tail.fragment)) != nil {
+                    ingest(tail.fragment)
+                } else {
+                    nextOffset = min(size, tail.position)
+                }
+            }
+            Shell.overwrite(String(nextOffset), to: offsetPath)
         }
 
         lock.release()
@@ -132,19 +146,25 @@ enum SessionIngest {
         return 0
     }
 
-    /// `tail -c +$((offset + 1)) "$file"`, one line at a time. A final
-    /// fragment without a newline still counts as a line, as it does for grep.
-    /// The file is read in pieces, so the first pass over a long session never
+    /// `tail -c +$((offset + 1)) "$file"`, one line at a time: each line that
+    /// ends in a newline goes to `body`. A final fragment without one is
+    /// returned with its position in the file, for the caller to judge. The
+    /// file is read in pieces, so the first pass over a long session never
     /// holds the whole tail (and a copy of it) in memory.
-    private static func forEachNewLine(of file: String, from offset: Int, _ body: (Data) -> Void) {
-        guard let handle = FileHandle(forReadingAtPath: file) else { return }
+    private static func readLines(
+        of file: String,
+        from offset: Int,
+        _ body: (Data) -> Void
+    ) -> (fragment: Data, position: Int)? {
+        guard let handle = FileHandle(forReadingAtPath: file) else { return nil }
         defer { try? handle.close() }
         do {
             try handle.seek(toOffset: UInt64(offset))
         } catch {
-            return
+            return nil
         }
         var pending = Data()
+        var position = offset
         while let chunk = try? handle.read(upToCount: 1 << 20), !chunk.isEmpty {
             pending.append(chunk)
             var start = pending.startIndex
@@ -152,9 +172,10 @@ enum SessionIngest {
                 body(pending[start..<newline])
                 start = pending.index(after: newline)
             }
+            position += start - pending.startIndex
             pending = Data(pending[start...])
         }
-        if !pending.isEmpty { body(pending) }
+        return pending.isEmpty ? nil : (pending, position)
     }
 
     /// `$(jq -r 'path // empty')`: jq's raw text of the value, or "".

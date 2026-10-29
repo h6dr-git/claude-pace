@@ -2,9 +2,10 @@ import Foundation
 
 /// The Claude Code `statusLine` command (formerly bridge/statusline.sh).
 /// Claude Code pipes a JSON blob (including `rate_limits`, when it has them)
-/// on stdin at every render; this writes a snapshot the menu bar reads,
-/// records a history line when something changed, and prints the status text.
-/// It must stay fast: no network, one stdin read.
+/// on stdin at every render; this writes a snapshot the menu bar reads when
+/// the input carries a limit window, records a history line when something
+/// changed, and prints the status text. It must stay fast: no network, one
+/// stdin read.
 enum StatusLineBridge {
     static func run(input rawInput: Data, home: String, environment: [String: String]) -> String {
         let paths = AppPaths(home: home)
@@ -45,16 +46,26 @@ enum StatusLineBridge {
         // error, but the `&& mv` only happens when every value succeeded.
         var snapshotText = ""
         var snapshotFailed = false
+        var carriesWindow = false
         for value in values {
             if let snapshot = makeSnapshot(value, now: now) {
                 snapshotText += JSONValue.object(snapshot).prettyText + "\n"
+                if hasWindow(snapshot) { carriesWindow = true }
             } else {
                 snapshotFailed = true
             }
         }
+        // Claude Code 2.1.x sends no rate_limits. A snapshot built from such
+        // input has neither a 5h nor a weekly window, and putting it in place
+        // (as the script did) blanked the `/usage` poller's reading until its
+        // next run. Only input that carries a window replaces the snapshot.
         let temporary = paths.snapshot + ".tmp"
         if Shell.overwrite(snapshotText, to: temporary), !snapshotFailed {
-            _ = Shell.move(temporary, to: paths.snapshot)
+            if carriesWindow {
+                _ = Shell.move(temporary, to: paths.snapshot)
+            } else {
+                unlink(temporary)
+            }
         }
 
         // The signature decides whether a history line is due. A value whose
@@ -111,6 +122,15 @@ enum StatusLineBridge {
         }
 
         _ = UsageLogRotation.rotate(paths.usageLog, environment: environment, io: .silent)
+    }
+
+    /// A 5h or weekly window that is present, as jq's `!= null` sees it.
+    private static func hasWindow(_ snapshot: JSONObject) -> Bool {
+        ["fiveHour", "sevenDay"].contains { key in
+            guard let window = snapshot[key] else { return false }
+            if case .null = window { return false }
+            return true
+        }
     }
 
     /// `(.model.display_name // .model.id // null)`; nil where jq errors.
