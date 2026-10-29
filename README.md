@@ -1,5 +1,7 @@
 # claude-pace — AI 사용량 메뉴바 게이지
 
+[![build](https://github.com/h6dr-git/claude-pace/actions/workflows/build.yml/badge.svg)](https://github.com/h6dr-git/claude-pace/actions/workflows/build.yml)
+
 Claude·Codex 구독 한도(5시간·주간)를 지금 얼마나 썼는지, 언제 리셋되는지, 이 속도면 리셋 전에 바닥나는지를 macOS 메뉴바의 링 하나로 보여 주는 앱.
 
 > 비공식 개인 프로젝트 — Anthropic·OpenAI와 관계없음. 공식 CLI 명령(`claude -p "/usage"`, `codex app-server`)만 쓰고, 비공식 API·세션 쿠키·OAuth 토큰 직접 호출은 하지 않음.
