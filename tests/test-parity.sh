@@ -98,8 +98,12 @@ run_scenario() {
     rm -rf "$work/result-$impl"
     mv "$home" "$work/result-$impl"
   done
+  local steps ok
+  steps=$(wc -l < "$work/result-new/_out/transcript" | tr -d ' ')
+  ok=$(grep -c 'exit=0$' "$work/result-new/_out/transcript")
   if python3 "$parity_dir/compare.py" "$work/result-legacy" "$work/result-new" > "$work/compare.out"; then
-    echo "PASS: $scenario"
+    echo "PASS: $scenario ($(tail -n 1 "$work/compare.out"), $steps runs, $ok with exit 0)"
+    echo "${scenario#scenario_}: $(tail -n 1 "$work/compare.out") from $steps runs ($ok exit 0)" >> "$work/digest.txt"
   else
     cat "$work/compare.out"
     echo "FAIL: $scenario" >&2
@@ -433,6 +437,8 @@ run_scenario scenario_poll_usage
 run_scenario scenario_poll_codex
 run_scenario scenario_statusline
 burst_check
+
+[ -f "$work/digest.txt" ] && annotate notice "parity" "$work/digest.txt"
 
 if [ "$failures" -ne 0 ]; then
   echo "FAIL: $failures parity scenario(s) differ" >&2

@@ -142,9 +142,11 @@ def main():
     legacy_root, new_root = sys.argv[1], sys.argv[2]
     legacy, new = files(legacy_root), files(new_root)
     problems = []
+    compared = 0
     for relative in sorted(set(legacy) | set(new)):
         if any(pattern.search(relative) for pattern in IGNORED):
             continue
+        compared += 1
         if relative not in new:
             problems.append(f"only the legacy run wrote {relative}")
         elif relative not in legacy:
@@ -157,6 +159,7 @@ def main():
         print("  - " + problem)
     if len(problems) > 25:
         print(f"  … and {len(problems) - 25} more")
+    print(f"compared {compared} files")
     return 1 if problems else 0
 
 
