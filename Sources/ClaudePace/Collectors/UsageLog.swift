@@ -150,9 +150,12 @@ enum UsageLogSegment {
             if case .null = total { return true }
             guard let stamp = timestamp else { return true }
             if latestCodexTimestamp == nil || JSONValue.compareBytes(stamp, latestCodexTimestamp ?? "") >= 0 {
+                guard let last = value.jqValue(["tokenUsage", "last", "total_tokens"], or: JSONValue.null) else {
+                    return false
+                }
                 latestCodexTimestamp = stamp
                 latestCodexTotal = total
-                latestCodexLast = value.jqValue(["tokenUsage", "last", "total_tokens"], or: JSONValue.null)
+                latestCodexLast = last
             }
             return true
         }
@@ -343,7 +346,8 @@ enum UsageHistorySummaryBuilder {
                 // `[ "$indexed_bytes" -ne "$expected_bytes" ]` only fires for a
                 // single document whose `.bytes // -1` reads as an integer.
                 if stream.values.count == 1,
-                   let indexed = Int(stream.values[0].jqValue(["bytes"], or: .int(-1)).jqRawText),
+                   let indexedValue = stream.values[0].jqValue(["bytes"], or: .int(-1)),
+                   let indexed = Int(indexedValue.jqRawText),
                    indexed != expectedBytes {
                     io.err("archived usage segment changed after indexing: \(segment)")
                     lock.release()
@@ -432,8 +436,8 @@ enum UsageHistorySummaryBuilder {
         }
         result["bySource"] = JSONValue.array(bySource)
         result["lastTimestamp"] = lastTimestamp
-        result["latestCodexTotal"] = latest?.jqValue(["total"], or: JSONValue.null) ?? JSONValue.null
-        result["latestCodexLast"] = latest?.jqValue(["last"], or: JSONValue.null) ?? JSONValue.null
+        result["latestCodexTotal"] = latest.flatMap { $0.jqValue(["total"], or: JSONValue.null) } ?? JSONValue.null
+        result["latestCodexLast"] = latest.flatMap { $0.jqValue(["last"], or: JSONValue.null) } ?? JSONValue.null
         return JSONValue.object(result)
     }
 

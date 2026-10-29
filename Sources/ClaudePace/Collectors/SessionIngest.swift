@@ -153,13 +153,16 @@ enum SessionIngest {
         return Shell.trimmingTrailingNewlines(found.jqRawText)
     }
 
-    /// `(((.timestamp // "") | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601?) // null)`
-    private static func capturedAt(_ value: JSONValue) -> JSONValue {
-        guard case .string(let stamp) = value.jqValue(["timestamp"], or: .string("")),
-              let seconds = JQTime.fromISO8601(JQTime.droppingFractionalSeconds(stamp)) else {
-            return .null
+    /// `(((.timestamp // "") | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601?) // null)`.
+    /// nil where jq raises an error — `sub` on a timestamp that is not a
+    /// string — which makes the whole record fail (the line is skipped).
+    private static func captureTime(_ value: JSONValue) -> JSONValue? {
+        guard let raw = value.jqValue(["timestamp"], or: .string("")),
+              case .string(let stamp) = raw else { return nil }
+        guard let seconds = JQTime.fromISO8601(JQTime.droppingFractionalSeconds(stamp)) else {
+            return JSONValue.null
         }
-        return .int(seconds)
+        return JSONValue.int(seconds)
     }
 
     private static func codexEvent(_ value: JSONValue, file: String) -> (id: String, record: JSONObject)? {
@@ -169,19 +172,27 @@ enum SessionIngest {
         let last = rawText(value, ["payload", "info", "last_token_usage", "total_tokens"])
         let id = "codex-session:" + Shell.sha256Hex("\(file):\(timestamp):\(total):\(last)")
 
+        // Any field that errors fails the jq program, and the line is skipped.
+        guard let capturedAt = captureTime(value),
+              let stamp = value.jqValue(["timestamp"], or: .null),
+              let contextWindow = value.jqValue(["payload", "info", "model_context_window"], or: .null),
+              let totalUsage = value.jqValue(["payload", "info", "total_token_usage"], or: .null),
+              let lastUsage = value.jqValue(["payload", "info", "last_token_usage"], or: .null),
+              let rateLimits = value.jqValue(["payload", "rate_limits"], or: .null) else { return nil }
+
         var record = JSONObject()
         record["schema"] = JSONValue.string("usage.v1")
         record["source"] = JSONValue.string("codex-session")
         record["event_id"] = JSONValue.string(id)
-        record["capturedAt"] = capturedAt(value)
-        record["timestamp"] = value.jqValue(["timestamp"], or: .null)
+        record["capturedAt"] = capturedAt
+        record["timestamp"] = stamp
         record["model"] = JSONValue.null
-        record["modelContextWindow"] = value.jqValue(["payload", "info", "model_context_window"], or: .null)
+        record["modelContextWindow"] = contextWindow
         record["tokenUsage"] = JSONValue.object(JSONObject([
-            "total": value.jqValue(["payload", "info", "total_token_usage"], or: .null),
-            "last": value.jqValue(["payload", "info", "last_token_usage"], or: .null)
+            "total": totalUsage,
+            "last": lastUsage
         ]))
-        record["rateLimits"] = value.jqValue(["payload", "rate_limits"], or: .null)
+        record["rateLimits"] = rateLimits
         record["sourcePath"] = JSONValue.string(file)
         return (id, record)
     }
@@ -204,22 +215,31 @@ enum SessionIngest {
         guard !requestID.isEmpty, !timestamp.isEmpty else { return nil }
         let id = "claude-session:" + Shell.sha256Hex("\(file):\(requestID)")
 
-        func tokens(_ key: String) -> JSONValue {
+        func tokens(_ key: String) -> JSONValue? {
             value.jqValue(["message", "usage", key], or: .int(0))
         }
+        guard let capturedAt = captureTime(value),
+              let stamp = value.jqValue(["timestamp"], or: .null),
+              let model = value.jqValue(["message", "model"], or: .null),
+              let entrypoint = value.jqValue(["entrypoint"], or: .null),
+              let input = tokens("input_tokens"),
+              let output = tokens("output_tokens"),
+              let cacheCreation = tokens("cache_creation_input_tokens"),
+              let cacheRead = tokens("cache_read_input_tokens") else { return nil }
+
         var record = JSONObject()
         record["schema"] = JSONValue.string("usage.v1")
         record["source"] = JSONValue.string("claude-session")
         record["event_id"] = JSONValue.string(id)
-        record["capturedAt"] = capturedAt(value)
-        record["timestamp"] = value.jqValue(["timestamp"], or: .null)
-        record["model"] = value.jqValue(["message", "model"], or: .null)
-        record["entrypoint"] = value.jqValue(["entrypoint"], or: .null)
+        record["capturedAt"] = capturedAt
+        record["timestamp"] = stamp
+        record["model"] = model
+        record["entrypoint"] = entrypoint
         record["tokenUsage"] = JSONValue.object(JSONObject([
-            "input_tokens": tokens("input_tokens"),
-            "output_tokens": tokens("output_tokens"),
-            "cache_creation_input_tokens": tokens("cache_creation_input_tokens"),
-            "cache_read_input_tokens": tokens("cache_read_input_tokens")
+            "input_tokens": input,
+            "output_tokens": output,
+            "cache_creation_input_tokens": cacheCreation,
+            "cache_read_input_tokens": cacheRead
         ]))
         record["rateLimits"] = JSONValue.null
         record["sourcePath"] = JSONValue.string(file)

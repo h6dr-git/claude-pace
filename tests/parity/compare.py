@@ -23,6 +23,7 @@ MOVED = {
 IGNORED = [re.compile(pattern) for pattern in (
     r"(^|/)_out/[^/]*\.err$",        # stderr wording is not part of the contract
     r"(^|/)\.claude-history\.ts$",   # holds the wall-clock time of the last record
+    r"^Library/Caches/",             # interpreter caches, not collector output
 )]
 
 # Command output that is JSON (reports and summaries).
@@ -91,6 +92,11 @@ def describe(value):
 
 
 def compare_file(relative, legacy_path, new_path):
+    if os.path.islink(legacy_path) or os.path.islink(new_path):
+        if not (os.path.islink(legacy_path) and os.path.islink(new_path)):
+            return "a symbolic link in one run only"
+        a, b = os.readlink(legacy_path), os.readlink(new_path)
+        return None if a == b else f"link target {a!r} vs {b!r}"
     with open(legacy_path, "rb") as handle:
         legacy = handle.read()
     with open(new_path, "rb") as handle:

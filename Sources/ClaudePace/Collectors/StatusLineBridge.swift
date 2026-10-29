@@ -57,10 +57,12 @@ enum StatusLineBridge {
             _ = Shell.move(temporary, to: paths.snapshot)
         }
 
-        // The signature decides whether a history line is due.
+        // The signature decides whether a history line is due. A value whose
+        // filter errors prints nothing, so it adds nothing to the hash.
         var signatureInput = ""
         for value in values {
-            signatureInput += JSONValue.array([model(value), value.jqValue(["rate_limits"], or: .object(JSONObject()))]).compactText + "\n"
+            guard let name = modelName(value), let limits = rateLimits(value) else { continue }
+            signatureInput += JSONValue.array([name, limits]).compactText + "\n"
         }
         let signature = Shell.sha256Hex(signatureInput)
         let interval = Shell.digits(Shell.setting(environment, "CLAUDEPACE_HISTORY_INTERVAL"), default: 300)
@@ -77,21 +79,30 @@ enum StatusLineBridge {
             let lastTime = Shell.digits(Shell.readText(historyTime), default: 0)
 
             if signature != lastSignature || now - lastTime >= interval {
+                // jq appends a line for every value it could evaluate; the
+                // signature and time are only stored when none failed.
                 var lines = ""
+                var failed = false
                 for value in values {
+                    guard let name = modelName(value), let limits = rateLimits(value) else {
+                        failed = true
+                        continue
+                    }
                     var entry = JSONObject()
                     entry["schema"] = JSONValue.string("usage.v1")
                     entry["source"] = JSONValue.string("claude-statusline")
                     entry["event_id"] = JSONValue.string("claude-statusline:\(now):\(signature)")
                     entry["capturedAt"] = JSONValue.int(now)
                     entry["timestamp"] = JSONValue.string(Shell.utcTimestamp(now))
-                    entry["model"] = model(value)
-                    entry["rateLimits"] = value.jqValue(["rate_limits"], or: .object(JSONObject()))
+                    entry["model"] = name
+                    entry["rateLimits"] = limits
                     entry["tokenUsage"] = JSONValue.null
                     entry["sourcePath"] = JSONValue.string("Claude Code statusLine")
                     lines += JSONValue.object(entry).compactText + "\n"
                 }
-                if Shell.append(lines, to: paths.usageLog) {
+                // `>> file` opens (and creates) the ledger even when jq prints nothing.
+                let appended = Shell.append(lines, to: paths.usageLog)
+                if appended, !failed {
                     Shell.overwrite(signature, to: history)
                     Shell.overwrite(String(now), to: historyTime)
                 }
@@ -102,24 +113,33 @@ enum StatusLineBridge {
         _ = UsageLogRotation.rotate(paths.usageLog, environment: environment, io: .silent)
     }
 
-    /// `(.model.display_name // .model.id // null)`
-    private static func model(_ value: JSONValue) -> JSONValue {
-        value.jqValue(["model", "display_name"]) ?? value.jqValue(["model", "id"]) ?? .null
+    /// `(.model.display_name // .model.id // null)`; nil where jq errors.
+    private static func modelName(_ value: JSONValue) -> JSONValue? {
+        guard let name = value.jqPath(["model", "display_name"]) else { return nil }
+        if name.isTruthy { return name }
+        guard let id = value.jqPath(["model", "id"]) else { return nil }
+        return id.isTruthy ? id : JSONValue.null
+    }
+
+    /// `(.rate_limits // {})`; nil where jq errors.
+    private static func rateLimits(_ value: JSONValue) -> JSONValue? {
+        value.jqValue(["rate_limits"], or: .object(JSONObject()))
     }
 
     /// The snapshot filter, or nil where jq would raise an error.
     private static func makeSnapshot(_ value: JSONValue, now: Int) -> JSONObject? {
-        let limits = value.jqValue(["rate_limits"], or: .object(JSONObject()))
-        guard let fiveHour = limits.jqField("five_hour"),
+        guard let limits = rateLimits(value),
+              let fiveHour = limits.jqField("five_hour"),
               let sevenDay = limits.jqField("seven_day"),
               let sevenDayOpus = limits.jqField("seven_day_opus"),
               let sevenDaySonnet = limits.jqField("seven_day_sonnet") else { return nil }
 
-        // `.model.display_name // .model.id`: the right-hand side is not
-        // protected, so an unindexable `.model` is an error.
+        // `.model.display_name // .model.id` (no `// null` here: a falsy id
+        // is kept as it is).
+        guard let displayName = value.jqPath(["model", "display_name"]) else { return nil }
         let model: JSONValue
-        if let name = value.jqValue(["model", "display_name"]) {
-            model = name
+        if displayName.isTruthy {
+            model = displayName
         } else {
             guard let id = value.jqPath(["model", "id"]) else { return nil }
             model = id

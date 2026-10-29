@@ -47,10 +47,84 @@ struct JSONNumber {
 
     var doubleValue: Double { Double(text) ?? .nan }
 
+    private var isIntegerLiteral: Bool {
+        !text.contains(".") && !text.contains("e") && !text.contains("E")
+    }
+
     /// The literal as an integer, when it is written as one.
     var intValue: Int? {
-        guard !text.contains("."), !text.contains("e"), !text.contains("E") else { return nil }
-        return Int(text)
+        isIntegerLiteral ? Int(text) : nil
+    }
+
+    /// How jq 1.7+ prints the number: decNumber's to-scientific-string, which
+    /// keeps "8.0" and "1.50" as written but turns "1e3" into "1E+3" and
+    /// "0.0000001" into "1E-7".
+    var jqText: String {
+        let bytes = Array(text.utf8)
+        var index = 0
+        var negative = false
+        if index < bytes.count, bytes[index] == UInt8(ascii: "-") {
+            negative = true
+            index += 1
+        }
+        var digits: [UInt8] = []
+        var exponent = 0
+        var afterPoint = false
+        while index < bytes.count, bytes[index] != UInt8(ascii: "e"), bytes[index] != UInt8(ascii: "E") {
+            if bytes[index] == UInt8(ascii: ".") {
+                afterPoint = true
+            } else {
+                digits.append(bytes[index])
+                if afterPoint { exponent -= 1 }
+            }
+            index += 1
+        }
+        if index < bytes.count {
+            index += 1
+            var sign = 1
+            if index < bytes.count, bytes[index] == UInt8(ascii: "-") || bytes[index] == UInt8(ascii: "+") {
+                if bytes[index] == UInt8(ascii: "-") { sign = -1 }
+                index += 1
+            }
+            var value = 0
+            while index < bytes.count, value < 1_000_000_000 {
+                guard bytes[index] >= 0x30, bytes[index] <= 0x39 else { return text }
+                value = value * 10 + Int(bytes[index] - 0x30)
+                index += 1
+            }
+            exponent += sign * value
+        }
+        guard !digits.isEmpty, digits.allSatisfy({ $0 >= 0x30 && $0 <= 0x39 }) else { return text }
+        while digits.count > 1, digits[0] == UInt8(ascii: "0") { digits.removeFirst() }
+
+        let coefficient = String(decoding: digits, as: UTF8.self)
+        let adjusted = exponent + digits.count - 1
+        var result = negative ? "-" : ""
+        if exponent <= 0 && adjusted >= -6 {
+            if exponent == 0 {
+                result += coefficient
+            } else {
+                let integerDigits = digits.count + exponent
+                if integerDigits > 0 {
+                    result += String(coefficient.prefix(integerDigits)) + "." + String(coefficient.dropFirst(integerDigits))
+                } else {
+                    result += "0." + String(repeating: "0", count: -integerDigits) + coefficient
+                }
+            }
+        } else {
+            result += String(coefficient.prefix(1))
+            if digits.count > 1 { result += "." + String(coefficient.dropFirst()) }
+            result += "E" + (adjusted >= 0 ? "+" : "-") + String(abs(adjusted))
+        }
+        return result
+    }
+
+    /// How Python's json module prints the parsed number: ints as digits,
+    /// everything else as a float (`repr`).
+    var pythonText: String {
+        if isIntegerLiteral { return text == "-0" ? "0" : text }
+        guard let value = Double(text), value.isFinite else { return text }
+        return "\(value)"
     }
 }
 
@@ -141,15 +215,18 @@ extension JSONValue {
         return current
     }
 
-    /// `path // empty`: the value unless the path errors or is null/false.
+    /// `path // empty` as `$(jq -r ...)` sees it: nil for null/false and
+    /// for an error alike (both print nothing).
     func jqValue(_ keys: [String]) -> JSONValue? {
         guard let value = jqPath(keys), value.isTruthy else { return nil }
         return value
     }
 
-    /// `path // fallback` (jq's `//` also swallows errors on its left side).
-    func jqValue(_ keys: [String], or fallback: JSONValue) -> JSONValue {
-        jqValue(keys) ?? fallback
+    /// `path // fallback`. jq does not hide errors behind `//` (an error on
+    /// the left fails the whole expression), so nil means "jq raised an error".
+    func jqValue(_ keys: [String], or fallback: JSONValue) -> JSONValue? {
+        guard let value = jqPath(keys) else { return nil }
+        return value.isTruthy ? value : fallback
     }
 
     /// What `jq -r` prints for this value: strings raw, anything else as
@@ -322,7 +399,11 @@ extension JSONValue {
         case .bool(let value):
             out += value ? "true" : "false"
         case .number(let number):
-            out += number.text
+            if case .python = style {
+                out += number.pythonText
+            } else {
+                out += number.jqText
+            }
         case .string(let string):
             JSONValue.writeString(string, into: &out, style: style)
         case .array(let items):

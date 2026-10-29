@@ -20,6 +20,8 @@ parity_dir="$repo_dir/tests/parity"
 # The app runs its collectors without locale variables, so the scripts' `sort`
 # compared bytes. Keep that, and keep the caller's settings out of the runs.
 export LC_ALL=C
+# Interpreters must not drop caches into the fixture HOME.
+export PYTHONDONTWRITEBYTECODE=1
 unset CLAUDE_BIN CODEX_BIN CODEX_SESSIONS_DIR CLAUDE_PROJECTS_DIR CODEX_USAGE_MTIME_DAYS \
   CLAUDE_USAGE_MTIME_DAYS USAGE_LOG_MAX_BYTES USAGE_LOG_CURRENT_PERIOD USAGE_LOG_LOCK_TIMEOUT \
   USAGE_DAY_OFFSET_SECONDS CLAUDEPACE_HISTORY_INTERVAL
@@ -96,13 +98,26 @@ run_scenario() {
     rm -rf "$work/result-$impl"
     mv "$home" "$work/result-$impl"
   done
-  if python3 "$parity_dir/compare.py" "$work/result-legacy" "$work/result-new"; then
+  if python3 "$parity_dir/compare.py" "$work/result-legacy" "$work/result-new" > "$work/compare.out"; then
     echo "PASS: $scenario"
   else
+    cat "$work/compare.out"
     echo "FAIL: $scenario" >&2
-    echo "::error title=parity $scenario::legacy and Swift results differ (see log)"
+    annotate error "parity $scenario" "$work/compare.out"
     failures=$((failures + 1))
   fi
+}
+
+# annotate <level> <title> <file>: show a file's text as a CI annotation.
+annotate() {
+  [ -n "${GITHUB_ACTIONS:-}" ] || return 0
+  python3 -c '
+import sys
+level, title, path = sys.argv[1:4]
+body = open(path, encoding="utf-8", errors="replace").read()[:3500]
+escape = lambda text: text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+print("::" + level + " title=" + escape(title) + "::" + escape(body))
+' "$1" "$2" "$3"
 }
 
 app_dir() { printf '%s' "$home/Library/Application Support/ClaudePace"; }
@@ -394,12 +409,30 @@ scenario_statusline() {
   status_line empty empty.json
 }
 
+# Not a parity case: replies that arrive in one burst. The old poller is
+# expected to lose the second line here; this records what each one did.
+burst_check() {
+  local impl statuses=""
+  for impl in legacy new; do
+    home="$work/burst-$impl"
+    rm -rf "$home"
+    mkdir -p "$home"
+    step_number=0
+    CODEX_BIN="$fakes/codex" FAKE_CODEX_MODE=burst step burst poll-codex-usage
+    statuses="$statuses $impl:$(sed -n 's/.*exit=//p' "$home/_out/transcript")"
+  done
+  echo "codex replies in one burst ->$statuses"
+  echo "replies in one burst -> exit$statuses" > "$work/burst.txt"
+  annotate notice "codex burst" "$work/burst.txt"
+}
+
 run_scenario scenario_ingest_codex
 run_scenario scenario_ingest_claude
 run_scenario scenario_ledger
 run_scenario scenario_poll_usage
 run_scenario scenario_poll_codex
 run_scenario scenario_statusline
+burst_check
 
 if [ "$failures" -ne 0 ]; then
   echo "FAIL: $failures parity scenario(s) differ" >&2

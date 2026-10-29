@@ -171,7 +171,7 @@ enum CodexUsageCollector {
         case .null: return "None"
         case .bool(let flag): return flag ? "True" : "False"
         case .string(let string): return string
-        case .number(let number): return number.text
+        case .number(let number): return number.pythonText
         default: return value?.compactText ?? "None"
         }
     }

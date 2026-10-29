@@ -91,7 +91,8 @@ enum UsageReports {
 
     /// `(.timestamp // "") | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601?`
     private static func epoch(_ event: JSONValue) -> Epoch {
-        guard case .string(let stamp) = event.jqValue(["timestamp"], or: .string("")) else { return .failure }
+        guard let raw = event.jqValue(["timestamp"], or: .string("")),
+              case .string(let stamp) = raw else { return .failure }
         guard let seconds = JQTime.fromISO8601(JQTime.droppingFractionalSeconds(stamp)) else { return .dropped }
         return .seconds(seconds)
     }
@@ -117,7 +118,7 @@ enum UsageReports {
 
     /// `($x.field // 0)` as a number, or nil where arithmetic would fail.
     private static func amount(_ usage: JSONValue, _ field: String) -> Double? {
-        guard case .number(let number) = usage.jqValue([field], or: .int(0)) else { return nil }
+        guard let raw = usage.jqValue([field], or: .int(0)), case .number(let number) = raw else { return nil }
         return number.doubleValue
     }
 
@@ -144,9 +145,9 @@ enum UsageReports {
     private static func sessionSummary(_ group: [JSONValue]) -> JSONValue? {
         let events = jqStableSort(group, by: { $0.jqField("timestamp") ?? .null })
         guard let firstEvent = events.first, let lastEvent = events.last else { return nil }
-        let first = firstEvent.jqValue(["tokenUsage", "total"], or: .object(zeroUsage))
-        let last = lastEvent.jqValue(["tokenUsage", "total"], or: .object(zeroUsage))
-        guard let delta = combine(first, last, subtract: true) else { return nil }
+        guard let first = firstEvent.jqValue(["tokenUsage", "total"], or: .object(zeroUsage)),
+              let last = lastEvent.jqValue(["tokenUsage", "total"], or: .object(zeroUsage)),
+              let delta = combine(first, last, subtract: true) else { return nil }
 
         var summary = JSONObject()
         summary["sourcePath"] = firstEvent.jqField("sourcePath") ?? .null
