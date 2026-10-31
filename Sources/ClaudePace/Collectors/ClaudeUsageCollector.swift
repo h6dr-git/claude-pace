@@ -197,7 +197,16 @@ enum ClaudeUsageCollector {
             guard let used else { return old }
             var updated = old.objectValue ?? JSONObject()
             updated["used_percentage"] = .int(used)
-            if let reset { updated["resets_at"] = .number(JSONNumber(pythonFloat: reset)) }
+            if let reset {
+                updated["resets_at"] = .number(JSONNumber(pythonFloat: reset))
+            } else if case .number(let previous)? = updated["resets_at"],
+                      previous.doubleValue < Date().timeIntervalSince1970 {
+                // A fresh percentage without a readable reset must not inherit
+                // one that has already passed: that instant belongs to a window
+                // that ended, and the menu would read the new number as "no
+                // window open". No reset is honest; a stale one is not.
+                updated["resets_at"] = .null
+            }
             return .object(updated)
         }
         func oldWindow(_ key: String) -> JSONValue {

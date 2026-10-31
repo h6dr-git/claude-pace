@@ -22,6 +22,23 @@ CHANGES = [
         "if jq -e -s 'any(.[]; .fiveHour != null or .sevenDay != null)' \"$snap.tmp\" >/dev/null 2>&1; "
         'then mv -f "$snap.tmp" "$snap" 2>/dev/null; else rm -f "$snap.tmp"; fi; }',
     ),
+    (
+        # A `/usage` line with a percentage but no readable reset no longer
+        # inherits a reset that has already passed: that instant belongs to an
+        # ended window, and the menu would read the fresh number as "no window
+        # open". The reset becomes null instead.
+        "tools/poll-usage.sh",
+        "    if reset is not None:\n"
+        "        w['resets_at'] = reset          # prefer freshly parsed reset; else keep prior\n"
+        "    return w\n",
+        "    if reset is not None:\n"
+        "        w['resets_at'] = reset          # prefer freshly parsed reset; else keep prior\n"
+        "    elif (isinstance(w.get('resets_at'), (int, float))\n"
+        "          and not isinstance(w.get('resets_at'), bool)\n"
+        "          and w['resets_at'] < time.time()):\n"
+        "        w['resets_at'] = None\n"
+        "    return w\n",
+    ),
 ]
 
 

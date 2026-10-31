@@ -11,8 +11,10 @@ final class ClaudeUsagePoller {
     /// What the menu needs to tell "polling right now" from "not polling at
     /// all" when the reading on screen is old.
     struct Status {
-        /// Set while a poll is running.
-        let runningSince: Date?
+        /// Awake time the running poll has taken so far (nil: none running).
+        /// Measured on systemUptime, which stops while the Mac sleeps, so a
+        /// poll that slept along with the Mac is not mistaken for a stuck one.
+        let runningFor: TimeInterval?
         /// When the last poll started (nil: none since the app launched).
         let lastAttempt: Date?
     }
@@ -27,7 +29,8 @@ final class ClaudeUsagePoller {
     /// Guards the status fields, which the main thread reads while a poll
     /// holds `queue` for up to a couple of minutes.
     private let statusLock = NSLock()
-    private var runningSince: Date?
+    /// systemUptime when the running poll started.
+    private var runningSinceUptime: TimeInterval?
     private var lastAttempt: Date?
 
     private init() {}
@@ -35,7 +38,8 @@ final class ClaudeUsagePoller {
     var status: Status {
         statusLock.lock()
         defer { statusLock.unlock() }
-        return Status(runningSince: runningSince, lastAttempt: lastAttempt)
+        let runningFor = runningSinceUptime.map { ProcessInfo.processInfo.systemUptime - $0 }
+        return Status(runningFor: runningFor, lastAttempt: lastAttempt)
     }
 
     /// 180s matches the interval the usage endpoint's own request-rate cap was
@@ -52,7 +56,7 @@ final class ClaudeUsagePoller {
             self.statusLock.lock()
             let due = force || self.lastAttempt.map { started.timeIntervalSince($0) >= interval } ?? true
             if due {
-                self.runningSince = started
+                self.runningSinceUptime = ProcessInfo.processInfo.systemUptime
                 self.lastAttempt = started
             }
             self.statusLock.unlock()
@@ -77,7 +81,7 @@ final class ClaudeUsagePoller {
             let status = ClaudeUsageCollector.poll(context, io: .silent)
 
             self.statusLock.lock()
-            self.runningSince = nil
+            self.runningSinceUptime = nil
             self.statusLock.unlock()
             DispatchQueue.main.async { completion?(status == 0) }
         }

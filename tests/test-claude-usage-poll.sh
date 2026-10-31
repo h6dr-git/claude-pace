@@ -205,6 +205,26 @@ printf '%s' '{"model":{"display_name":"Opus 5.5"},"rate_limits":{"five_hour":{"u
 check "statusline with limits: 5h percent" "30" "$(field "$appdir/snapshot.json" fiveHour.used_percentage)"
 check "statusline with limits: week percent" "12" "$(field "$appdir/snapshot.json" sevenDay.used_percentage)"
 
+# --- 14) a percentage without a readable reset keeps a reset still ahead...
+printf '%s\n' 'Current session: 3% used' > "$scratch/noreset.txt"
+run_poll "$scratch/noreset.txt"
+check "no reset, future prior: 5h percent" "3" "$(field "$appdir/snapshot.json" fiveHour.used_percentage)"
+check "no reset, future prior: reset kept" "1893456000" "$(field "$appdir/snapshot.json" fiveHour.resets_at)"
+
+# --- 15) ...but never inherits one that has already passed (it belongs to an
+# ended window, and the menu would read the new number as "no window open")
+python3 - "$appdir/snapshot.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+snapshot = json.load(open(path))
+snapshot["fiveHour"]["resets_at"] = 1000000000
+json.dump(snapshot, open(path, "w"))
+PY
+run_poll "$scratch/noreset.txt"
+check "no reset, past prior: 5h percent" "3" "$(field "$appdir/snapshot.json" fiveHour.used_percentage)"
+check "no reset, past prior: stale reset dropped" "<none>" "$(field "$appdir/snapshot.json" fiveHour.resets_at)"
+check "no reset, past prior: state" "ok" "$(field "$appdir/claude-collector-state.json" status)"
+
 if [ "$failures" -ne 0 ]; then
   echo "FAIL: $failures claude-usage-poll assertions failed" >&2
   exit 1

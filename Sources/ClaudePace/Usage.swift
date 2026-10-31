@@ -54,6 +54,9 @@ enum MenuEntry {
 
 struct UsageView {
     let snapshot: Snapshot?
+    /// Whether this app is polling Claude (claude mode). Under another
+    /// provider the block is a leftover reading that will not be refreshed.
+    var polled = true
 
     private func calc(_ window: RLWindow?, length: TimeInterval) -> WindowCalc? {
         guard let window, window.isUsable,
@@ -145,20 +148,20 @@ struct UsageView {
         }
     }
 
-    /// The line for a window whose reset has passed: say it ended and that the
-    /// new value comes with the next poll, instead of drawing it as 0%.
+    /// The line for a window whose reset has passed: say it ended and where
+    /// the new value comes from, instead of drawing it as 0%.
     private func endedLine(_ snapshot: Snapshot, _ window: RLWindow?, fiveHour: Bool) -> String? {
+        let next = polled ? "새 값은 다음 조회 때" : "이 모드에선 새로 조회하지 않음"
         switch snapshot.reading(window) {
         case .endedSinceLastPoll(let endedAt):
             let when = clock(Date(timeIntervalSince1970: endedAt))
-            return fiveHour
-                ? "\(when)에 창 끝남 · 새 값은 다음 조회 때"
-                : "\(when)에 리셋됨 · 새 값은 다음 조회 때"
+            return fiveHour ? "\(when)에 창 끝남 · \(next)" : "\(when)에 리셋됨 · \(next)"
         case .noOpenWindow(let endedAt):
             let when = clock(Date(timeIntervalSince1970: endedAt))
-            return fiveHour
-                ? "지금 열린 창 없음 (\(when)에 끝남) · 다음 메시지부터 새로 시작"
-                : "\(when)에 리셋됨 · 새 값은 다음 조회 때"
+            guard polled, fiveHour else {
+                return fiveHour ? "\(when)에 창 끝남 · \(next)" : "\(when)에 리셋됨 · \(next)"
+            }
+            return "지금 열린 창 없음 (\(when)에 끝남) · 다음 메시지부터 새로 시작"
         case .current, .unavailable:
             return nil
         }
@@ -178,16 +181,16 @@ enum FreshnessPresentation {
         numbersShown: Bool,
         now: Date = Date()
     ) -> [MenuEntry] {
-        if let since = poll.runningSince, now.timeIntervalSince(since) > ClaudeUsagePoller.stuckAfter {
+        if let running = poll.runningFor, running > ClaudeUsagePoller.stuckAfter {
             return [
                 .header("⚠ 조회가 멈춤"),
-                .line("조회 하나가 \(dur(now.timeIntervalSince(since)))째 끝나지 않음 — 앱을 다시 시작해 주세요")
+                .line("조회 하나가 \(dur(running))째 끝나지 않음 — 앱을 다시 시작해 주세요")
             ]
         }
         guard case .stale(let age) = SnapshotFreshness.of(snapshot, at: now),
               let capturedAt = snapshot?.capturedAt else { return [] }
         let when = "\(dur(age)) 전(\(clock(Date(timeIntervalSince1970: capturedAt))))"
-        if poll.runningSince != nil {
+        if poll.runningFor != nil {
             return [
                 .header("↻ 다시 조회하는 중"),
                 .line(numbersShown ? "아래 숫자는 \(when) 값" : "마지막 값은 \(when)")
@@ -203,6 +206,16 @@ enum FreshnessPresentation {
             entries.append(.line("앱이 켜진 뒤 아직 조회 시도 없음"))
         }
         return entries
+    }
+
+    /// For the "Claude · 전환 보조" block under another provider, where Claude
+    /// is never polled: an old reading only gets its age, with no promise of
+    /// a next poll.
+    static func secondaryEntries(snapshot: Snapshot?, now: Date = Date()) -> [MenuEntry] {
+        guard case .stale(let age) = SnapshotFreshness.of(snapshot, at: now),
+              let capturedAt = snapshot?.capturedAt else { return [] }
+        let when = clock(Date(timeIntervalSince1970: capturedAt))
+        return [.line("마지막 값 \(dur(age)) 전(\(when)) · 이 모드에선 Claude를 조회하지 않음")]
     }
 }
 

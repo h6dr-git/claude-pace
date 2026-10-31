@@ -8,15 +8,28 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         environment: ProcessInfo.processInfo.environment
     )
 
-    /// Between "will sleep" and "did wake" nothing should start a poll: the
-    /// timer can fire on the way back before the wake notice arrives.
-    private var sleeping = false
-    private var wokeAt: Date?
+    // Sleep and wake are timed on systemUptime, which stops while the Mac
+    // sleeps and never jumps with clock changes.
+    /// Set at "will sleep": nothing should start a poll until the wake notice,
+    /// since the timer can fire on the way back before it arrives.
+    private var sleepingSinceUptime: TimeInterval?
+    private var wokeAtUptime: TimeInterval?
+    /// Bumped on every sleep and wake, so a wake poll scheduled before a newer
+    /// sleep does not fire after it.
+    private var wakeGeneration = 0
     /// Wi-Fi usually needs a few seconds after wake; a poll before that fails
     /// and would flash "⚠ 수집 중단" until the next regular poll.
     private static let wakePollDelay: TimeInterval = 8
     /// One more try when the first poll after waking did not come back ok.
     private static let wakeRetryDelay: TimeInterval = 30
+    /// If a wake notice were ever missed, regular polls resume after this much
+    /// awake time instead of staying held for good.
+    private static let missedWakeGrace: TimeInterval = 60
+
+    /// An open menu is not rebuilt under the pointer (a poll finishing would
+    /// otherwise shift "지금 갱신"/"종료"); it is rebuilt when it closes.
+    private var menuIsOpen = false
+    private var menuNeedsRebuild = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -49,7 +62,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func refresh() {
-        if canStartPolls {
+        if pollsAllowed() {
             if primaryProviderMode.shouldPollClaude {
                 ClaudeUsagePoller.shared.refreshIfDue { [weak self] _ in
                     self?.render()
@@ -78,42 +91,56 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Regular polls wait while the Mac sleeps and for a moment after it
     /// wakes; the wake handler starts the first one itself.
-    private var canStartPolls: Bool {
-        if sleeping { return false }
-        if let wokeAt, Date().timeIntervalSince(wokeAt) < AppController.wakePollDelay { return false }
+    private func pollsAllowed() -> Bool {
+        let uptime = ProcessInfo.processInfo.systemUptime
+        if let since = sleepingSinceUptime {
+            // Uptime does not advance during sleep, so this only grows while
+            // the Mac is awake.
+            if uptime - since < AppController.missedWakeGrace { return false }
+            sleepingSinceUptime = nil
+        }
+        if let woke = wokeAtUptime, uptime - woke < AppController.wakePollDelay { return false }
         return true
     }
 
     @objc private func systemWillSleep(_ notification: Notification) {
-        sleeping = true
+        sleepingSinceUptime = ProcessInfo.processInfo.systemUptime
+        wakeGeneration += 1
     }
 
     @objc private func systemDidWake(_ notification: Notification) {
-        sleeping = false
-        wokeAt = Date()
+        sleepingSinceUptime = nil
+        wokeAtUptime = ProcessInfo.processInfo.systemUptime
+        wakeGeneration += 1
+        let generation = wakeGeneration
         render()
         DispatchQueue.main.asyncAfter(deadline: .now() + AppController.wakePollDelay) { [weak self] in
-            self?.pollAfterWake(retrying: true)
+            self?.pollAfterWake(retrying: true, generation: generation)
         }
     }
 
     /// The first poll after waking runs right away rather than on the 180s
-    /// cadence. If it does not come back ok — the network is often still
-    /// returning — it is tried once more shortly after.
-    private func pollAfterWake(retrying: Bool) {
-        if primaryProviderMode.shouldPollClaude {
+    /// cadence — unless the reading is still newer than one regular interval
+    /// (a short nap), when the cadence just carries on. If it does not come
+    /// back ok — the network is often still returning — it is tried once more
+    /// shortly after. Nothing scheduled here survives a later sleep or wake.
+    private func pollAfterWake(retrying: Bool, generation: Int) {
+        guard generation == wakeGeneration else { return }
+        if primaryProviderMode.shouldPollClaude,
+           !AppController.isWithinOnePoll(SnapshotStore.shared.load()?.capturedAt) {
             ClaudeUsagePoller.shared.refreshIfDue(force: true) { [weak self] _ in
                 guard let self else { return }
                 self.render()
                 let status = ClaudeCollectorStateStore.shared.load()?.parsedStatus
                 if retrying, status != .ok {
                     DispatchQueue.main.asyncAfter(deadline: .now() + AppController.wakeRetryDelay) { [weak self] in
-                        self?.pollAfterWake(retrying: false)
+                        self?.pollAfterWake(retrying: false, generation: generation)
                     }
                 }
             }
         }
-        if primaryProviderMode.shouldPollCodex {
+        if primaryProviderMode.shouldPollCodex,
+           !AppController.isWithinOnePoll(CodexSnapshotStore.shared.load()?.capturedAt) {
             CodexUsagePoller.shared.refreshIfDue(force: true) { [weak self] _ in
                 self?.render()
             }
@@ -121,17 +148,33 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         render()
     }
 
-    /// Opening the menu redraws it with current relative times and starts a
+    /// Captured less than one regular 180s poll ago.
+    private static func isWithinOnePoll(_ capturedAt: Double?) -> Bool {
+        guard let capturedAt, capturedAt.isFinite else { return false }
+        let age = Date().timeIntervalSince1970 - capturedAt
+        return age >= 0 && age < 180
+    }
+
+    /// Opening the menu builds it with current relative times and starts a
     /// poll if one is due, instead of waiting for the next timer tick.
     func menuWillOpen(_ menu: NSMenu) {
+        // An open menu is itself proof the Mac is awake.
+        sleepingSinceUptime = nil
+        menuIsOpen = false
         refresh()
+        menuIsOpen = true
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuIsOpen = false
+        if menuNeedsRebuild { render() }
     }
 
     private func render() {
         let codexSnapshot = CodexSnapshotStore.shared.load()
         let codexView = CodexUsageView(snapshot: codexSnapshot)
         let claudeSnapshot = SnapshotStore.shared.load()
-        let claudeView = UsageView(snapshot: claudeSnapshot)
+        let claudeView = UsageView(snapshot: claudeSnapshot, polled: primaryProviderMode.shouldPollClaude)
         let collectorState = ClaudeCollectorStateStore.shared.load()
 
         let decision = PrimaryUsageSelector.decide(
@@ -166,12 +209,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             )
             statusItem.button?.toolTip = ClaudeUsageUnavailablePresentation.toolTip
             entries = claudeUnavailableEntries(reason: reason)
+            // Same place as above: right under the "Claude" header.
             let freshness = FreshnessPresentation.entries(
                 snapshot: claudeSnapshot, poll: pollStatus, numbersShown: false
             )
             if !freshness.isEmpty {
-                entries.append(.separator)
-                entries.append(contentsOf: freshness)
+                entries.insert(contentsOf: freshness + [MenuEntry.separator], at: 1)
             }
         case .codex:
             statusItem.button?.image = codexView.menuBarImage ?? unavailableStatusImage(
@@ -192,6 +235,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !primaryProviderMode.shouldPollClaude, shouldShowClaude(claudeSnapshot) {
             entries.append(.separator)
             entries.append(.header("Claude · 전환 보조"))
+            entries.append(contentsOf: FreshnessPresentation.secondaryEntries(snapshot: claudeSnapshot))
             entries.append(contentsOf: claudeView.entries)
         }
 
@@ -204,7 +248,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 entries.append(.line("마지막 기록 \(UsageHistoryTime.display(last))"))
             }
         }
-        rebuildMenu(entries)
+        // The menu-bar ring and tooltip above update right away; the open menu
+        // itself waits until it closes.
+        if menuIsOpen {
+            menuNeedsRebuild = true
+        } else {
+            menuNeedsRebuild = false
+            rebuildMenu(entries)
+        }
     }
 
     private func shouldShowClaude(_ snapshot: Snapshot?) -> Bool {
