@@ -32,6 +32,10 @@ enum PrimaryUsageProviderMode: Equatable {
     var shouldPollCodex: Bool { self == .codex }
     var shouldIngestCodexHistory: Bool { self == .codex }
     var shouldPollClaude: Bool { self == .claude }
+    /// Claude Code's own session logs (~/.claude/projects) are local files, so
+    /// the provider that already authorises Claude polling also feeds the
+    /// "기록" ledger from them. Other modes leave them alone.
+    var shouldIngestClaudeHistory: Bool { self == .claude }
 }
 
 enum PrimaryUsageUnavailableReason: Equatable {
@@ -58,8 +62,10 @@ enum PrimaryUsageDecision: Equatable {
 enum PrimaryUsageSelector {
     static let maximumCodexSnapshotAge: TimeInterval = 10 * 60
     /// Claude percentages come from a 180s poll that only runs while this Mac is
-    /// awake, so a short staleness bound would flap. The app rolls expired
-    /// windows forward locally; past a day the reading is dropped instead.
+    /// awake, so a short staleness bound would flap. Up to a day an old reading
+    /// stays on screen under a "갱신 멈춤" warning (SnapshotFreshness), with
+    /// windows whose reset has passed shown as ended rather than as 0%; past a
+    /// day the reading is dropped instead.
     static let maximumClaudeSnapshotAge: TimeInterval = 24 * 3600
     static let maximumClockSkew: TimeInterval = 60
 

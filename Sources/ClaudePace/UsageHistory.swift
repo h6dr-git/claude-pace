@@ -20,6 +20,25 @@ struct UsageHistorySummary {
     var hasRecords: Bool { totalRecords > 0 }
 }
 
+/// Ledger timestamps are ISO 8601 in UTC ("2026-08-17T11:56:40.212Z"); the
+/// menu shows them in local time like the other lines ("8/17 20:56").
+/// Anything that does not parse is shown as written.
+enum UsageHistoryTime {
+    static func display(_ timestamp: String) -> String {
+        let parser = ISO8601DateFormatter()
+        parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        var date = parser.date(from: timestamp)
+        if date == nil {
+            parser.formatOptions = [.withInternetDateTime]
+            date = parser.date(from: timestamp)
+        }
+        guard let date else { return timestamp }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "M/d HH:mm"
+        return formatter.string(from: date)
+    }
+}
+
 final class UsageHistoryStore {
     static let shared = UsageHistoryStore()
 
@@ -36,7 +55,13 @@ final class UsageHistoryStore {
         summaryURL = URL(fileURLWithPath: AppPaths(home: home).historySummary)
     }
 
-    func ingestSessionsIfDue(interval: TimeInterval = 60, force: Bool = false) {
+    /// Appends new session-log usage from `sources` to the ledger (at most
+    /// once per `interval`) and refreshes the summary the menu reads.
+    func ingestSessionsIfDue(
+        sources: [SessionIngest.Source],
+        interval: TimeInterval = 60,
+        force: Bool = false
+    ) {
         queue.async {
             guard !self.ingestRunning else { return }
             guard force || Date().timeIntervalSince(self.lastIngest) >= interval else { return }
@@ -45,13 +70,35 @@ final class UsageHistoryStore {
             self.lastIngest = Date()
 
             // The menu bar must never fail just because history ingestion
-            // failed, so the status is not checked.
-            _ = SessionIngest.run(
-                .codex,
-                home: self.home,
-                environment: ["CODEX_USAGE_MTIME_DAYS": "2"],
-                io: .silent
-            )
+            // failed, so the statuses are not checked (beyond the backfill
+            // marker below).
+            for source in sources {
+                switch source {
+                case .codex:
+                    _ = SessionIngest.run(
+                        .codex,
+                        home: self.home,
+                        environment: ["CODEX_USAGE_MTIME_DAYS": "2"],
+                        io: .silent
+                    )
+                case .claude:
+                    // Each minute only files touched in the last two days are
+                    // looked at. The very first Claude pass reaches back 30 days
+                    // — Claude Code deletes its own session logs after about a
+                    // month — and a marker keeps later passes at two days.
+                    let marker = AppPaths(home: self.home).appDir + "/.claude-session-backfill-done"
+                    let backfilled = Shell.exists(marker)
+                    let status = SessionIngest.run(
+                        .claude,
+                        home: self.home,
+                        environment: ["CLAUDE_USAGE_MTIME_DAYS": backfilled ? "2" : "30"],
+                        io: .silent
+                    )
+                    if !backfilled, status == 0 {
+                        Shell.touch(marker)
+                    }
+                }
+            }
 
             self.rebuildSummary()
 

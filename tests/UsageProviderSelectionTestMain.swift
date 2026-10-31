@@ -23,6 +23,10 @@ struct UsageProviderSelectionTestMain {
         try testClaudeModeIgnoresFreshCodexSnapshot()
         testUnknownCollectorSchemaIsTreatedAsBlocked()
         testClaudeUnavailablePresentationDoesNotClaimUsage()
+        testEndedWindowsDropTheirPercentage()
+        testWindowReadingNamesWhyThereIsNoNumber()
+        testFreshnessMarksOldReadings()
+        testClaudeModeIngestsClaudeHistoryOnly()
 
         guard failures == 0 else {
             fputs("FAIL: \(failures) usage-provider assertions failed\n", stderr)
@@ -472,6 +476,129 @@ struct UsageProviderSelectionTestMain {
         expect(
             !ClaudeUsageUnavailablePresentation.toolTip.contains("%"),
             "Claude unavailable message does not invent a percentage"
+        )
+    }
+
+    private static func testEndedWindowsDropTheirPercentage() {
+        let t = now.timeIntervalSince1970
+        let ended = RLWindow(used_percentage: 45, resets_at: t - 60).endingIfPast(at: now)
+        expect(ended.used_percentage == nil, "ended window drops its percentage instead of reading 0%")
+        expect(ended.resets_at == t - 60, "ended window keeps when it ended")
+        expect(!ended.isUsable, "ended window is not a reading")
+        expect(
+            RLWindow(used_percentage: 45, resets_at: t).endingIfPast(at: now).used_percentage == nil,
+            "a window ends exactly at its reset instant"
+        )
+
+        let open = RLWindow(used_percentage: 45, resets_at: t + 60).endingIfPast(at: now)
+        expect(open.used_percentage == 45 && open.resets_at == t + 60, "open window is left as read")
+        let noReset = RLWindow(used_percentage: 12, resets_at: nil).endingIfPast(at: now)
+        expect(noReset.used_percentage == 12 && noReset.resets_at == nil, "window without a reset is left as read")
+
+        // A day-old capture whose 5-hour window has ended still drives the ring
+        // from the weekly window — never from an invented 0% (the old roll-forward
+        // showed "5시간 0%" with a made-up reset for exactly this snapshot).
+        let fiveEnded = makeClaudeSnapshot(
+            capturedAt: t - 22 * 3600,
+            fiveHour: RLWindow(used_percentage: 45, resets_at: t - 21 * 3600),
+            sevenDay: RLWindow(used_percentage: 62, resets_at: t + 86_400)
+        ).droppingEndedWindows(at: now)
+        expect(fiveEnded.usableFiveHour == nil, "ended 5-hour window is not drawn")
+        expect(fiveEnded.usableSevenDay?.used_percentage == 62, "weekly reading is still usable")
+        expect(decideClaude(fiveEnded), equals: .claude, "weekly reading keeps Claude on screen")
+
+        let allEnded = makeClaudeSnapshot(
+            capturedAt: t - 22 * 3600,
+            fiveHour: RLWindow(used_percentage: 45, resets_at: t - 21 * 3600),
+            sevenDay: RLWindow(used_percentage: 62, resets_at: t - 3600)
+        ).droppingEndedWindows(at: now)
+        expect(
+            decideClaude(allEnded),
+            equals: .claudeUnavailable(.noUsableWindow),
+            "every window ended is no reading, not 0%"
+        )
+    }
+
+    private static func testWindowReadingNamesWhyThereIsNoNumber() {
+        let t = now.timeIntervalSince1970
+        let endedAfterPoll = makeClaudeSnapshot(
+            capturedAt: t - 3600,
+            fiveHour: RLWindow(used_percentage: 45, resets_at: t - 60)
+        )
+        expect(
+            endedAfterPoll.reading(endedAfterPoll.fiveHour, at: now) == .endedSinceLastPoll(endedAt: t - 60),
+            "window that ended after the last poll waits for the next one"
+        )
+        let dropped = endedAfterPoll.droppingEndedWindows(at: now)
+        expect(
+            dropped.reading(dropped.fiveHour, at: now) == .endedSinceLastPoll(endedAt: t - 60),
+            "an ended window stays recognisable after its percentage is dropped"
+        )
+
+        // `/usage` omits the session line between 5-hour windows, so a poll after
+        // the reset keeps the old window: nothing is open right now.
+        let polledAfterReset = makeClaudeSnapshot(
+            capturedAt: t - 30,
+            fiveHour: RLWindow(used_percentage: 45, resets_at: t - 60)
+        )
+        expect(
+            polledAfterReset.reading(polledAfterReset.fiveHour, at: now) == .noOpenWindow(endedAt: t - 60),
+            "poll after the reset without a new window means none is open"
+        )
+
+        let open = makeClaudeSnapshot(
+            capturedAt: t,
+            fiveHour: RLWindow(used_percentage: 22, resets_at: t + 600)
+        )
+        expect(
+            open.reading(open.fiveHour, at: now) == .current(used: 22, resetsAt: t + 600),
+            "open window is a current reading"
+        )
+        expect(open.reading(nil, at: now) == .unavailable, "missing window is unavailable")
+        expect(
+            open.reading(RLWindow(used_percentage: 140, resets_at: t + 600), at: now) == .unavailable,
+            "out-of-range percentage stays unavailable"
+        )
+    }
+
+    private static func testFreshnessMarksOldReadings() {
+        let t = now.timeIntervalSince1970
+        expect(
+            SnapshotFreshness.of(makeClaudeSnapshot(capturedAt: t), at: now) == .fresh,
+            "new reading is fresh"
+        )
+        expect(
+            SnapshotFreshness.of(makeClaudeSnapshot(capturedAt: t - SnapshotFreshness.staleAfter), at: now) == .fresh,
+            "ten-minute boundary is still fresh"
+        )
+        expect(
+            SnapshotFreshness.of(makeClaudeSnapshot(capturedAt: t - SnapshotFreshness.staleAfter - 1), at: now).isStale,
+            "past ten minutes the reading is stale"
+        )
+        expect(
+            SnapshotFreshness.of(makeClaudeSnapshot(capturedAt: t - 22 * 3600), at: now) == .stale(age: 22 * 3600),
+            "stale reading reports its age"
+        )
+        expect(SnapshotFreshness.of(nil, at: now) == .unknown, "no snapshot has unknown freshness")
+        expect(
+            SnapshotFreshness.of(makeClaudeSnapshot(capturedAt: nil), at: now) == .unknown,
+            "snapshot without a capture time has unknown freshness"
+        )
+        expect(!SnapshotFreshness.unknown.isStale, "unknown freshness is not reported as stale")
+    }
+
+    private static func testClaudeModeIngestsClaudeHistoryOnly() {
+        expect(
+            PrimaryUsageProviderMode.claude.shouldIngestClaudeHistory,
+            "Claude mode collects Claude Code session records"
+        )
+        expect(
+            !PrimaryUsageProviderMode.codex.shouldIngestClaudeHistory,
+            "Codex mode leaves Claude session logs alone"
+        )
+        expect(
+            !PrimaryUsageProviderMode.grokTransition.shouldIngestClaudeHistory,
+            "transition mode collects nothing"
         )
     }
 

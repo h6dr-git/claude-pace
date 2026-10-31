@@ -6,14 +6,24 @@ struct RLWindow: Codable {
     let used_percentage: Double?
     let resets_at: Double?          // unix epoch seconds
 
-    func rolledForward(length: TimeInterval, at now: Date = Date()) -> RLWindow {
-        guard var reset = resets_at else { return self }
-        let nowTs = now.timeIntervalSince1970
-        guard nowTs >= reset else { return self }
+    /// True once the window's reset instant has passed.
+    func hasEnded(at now: Date = Date()) -> Bool {
+        guard let reset = resets_at, reset.isFinite else { return false }
+        return now.timeIntervalSince1970 >= reset
+    }
 
-        let elapsedResetCount = floor((nowTs - reset) / length) + 1
-        reset += elapsedResetCount * length
-        return RLWindow(used_percentage: 0, resets_at: reset)
+    /// What a window can still claim at `now`. Once its reset has passed, the
+    /// stored percentage belonged to the window that ended, and the next
+    /// window's numbers cannot be known locally — a 5-hour window opens with
+    /// the next message, not on a fixed grid, and usage since then is unseen.
+    /// So the percentage is dropped (nothing may draw it as 0%) while the reset
+    /// instant is kept, letting the menu say when the window ended. The next
+    /// poll brings the real values. (This used to roll the window forward to
+    /// "0% used" with an invented reset time, which a stale snapshot then
+    /// showed as if it were a fresh reading.)
+    func endingIfPast(at now: Date = Date()) -> RLWindow {
+        guard hasEnded(at: now) else { return self }
+        return RLWindow(used_percentage: nil, resets_at: resets_at)
     }
 
     /// A window is only usable when the official source gave a finite
@@ -38,17 +48,36 @@ struct Snapshot: Codable {
     let modelWindows: [String: RLWindow]?
     let model: String?
 
-    func rolledForward(at now: Date = Date()) -> Snapshot {
-        let week: TimeInterval = 7 * 24 * 3600
-        return Snapshot(
+    /// The snapshot as it reads at `now`: windows whose reset has passed keep
+    /// their reset instant but lose their percentage (see `endingIfPast`).
+    func droppingEndedWindows(at now: Date = Date()) -> Snapshot {
+        Snapshot(
             capturedAt: capturedAt,
-            fiveHour: fiveHour?.rolledForward(length: 5 * 3600, at: now),
-            sevenDay: sevenDay?.rolledForward(length: week, at: now),
-            sevenDayOpus: sevenDayOpus?.rolledForward(length: week, at: now),
-            sevenDaySonnet: sevenDaySonnet?.rolledForward(length: week, at: now),
-            modelWindows: modelWindows?.mapValues { $0.rolledForward(length: week, at: now) },
+            fiveHour: fiveHour?.endingIfPast(at: now),
+            sevenDay: sevenDay?.endingIfPast(at: now),
+            sevenDayOpus: sevenDayOpus?.endingIfPast(at: now),
+            sevenDaySonnet: sevenDaySonnet?.endingIfPast(at: now),
+            modelWindows: modelWindows?.mapValues { $0.endingIfPast(at: now) },
             model: model
         )
+    }
+
+    /// What the menu can honestly say about one of this snapshot's windows.
+    func reading(_ window: RLWindow?, at now: Date = Date()) -> WindowReading {
+        guard let window else { return .unavailable }
+        if window.hasEnded(at: now), let reset = window.resets_at {
+            // A poll taken after the reset that still carried the old window
+            // means `/usage` printed no new one (it omits the session line
+            // between 5-hour windows): nothing is open right now.
+            if let capturedAt, capturedAt.isFinite, capturedAt >= reset {
+                return .noOpenWindow(endedAt: reset)
+            }
+            return .endedSinceLastPoll(endedAt: reset)
+        }
+        guard window.isUsable, let used = window.used_percentage, let reset = window.resets_at else {
+            return .unavailable
+        }
+        return .current(used: used, resetsAt: reset)
     }
 
     /// The windows the menu bar can actually draw from.
@@ -60,6 +89,44 @@ struct Snapshot: Codable {
         guard let capturedAt, capturedAt.isFinite else { return false }
         let age = now.timeIntervalSince1970 - capturedAt
         return age >= -maximumClockSkew && age <= maximumAge
+    }
+}
+
+/// One window as the menu may present it.
+enum WindowReading: Equatable {
+    /// A real percentage with its reset still ahead.
+    case current(used: Double, resetsAt: Double)
+    /// The reset passed after the last poll: the stored number belonged to the
+    /// window that ended, and the new one arrives with the next poll.
+    case endedSinceLastPoll(endedAt: Double)
+    /// A poll after the reset still saw no new window: none is open now.
+    case noOpenWindow(endedAt: Double)
+    /// No usable reading at all.
+    case unavailable
+}
+
+/// How current a Claude reading is. The official poll runs every 180s while
+/// the Mac is awake, so a reading older than a few missed polls means
+/// collection is not keeping up — the Mac slept, the poller stalled, or polls
+/// are failing — and the menu has to say so instead of letting an old number
+/// pass for the current one.
+enum SnapshotFreshness: Equatable {
+    case fresh
+    case stale(age: TimeInterval)
+    case unknown
+
+    /// Three missed 180s polls plus slack.
+    static let staleAfter: TimeInterval = 10 * 60
+
+    static func of(_ snapshot: Snapshot?, at now: Date = Date()) -> SnapshotFreshness {
+        guard let capturedAt = snapshot?.capturedAt, capturedAt.isFinite else { return .unknown }
+        let age = now.timeIntervalSince1970 - capturedAt
+        return age > staleAfter ? .stale(age: age) : .fresh
+    }
+
+    var isStale: Bool {
+        if case .stale = self { return true }
+        return false
     }
 }
 

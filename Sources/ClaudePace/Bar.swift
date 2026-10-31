@@ -45,7 +45,16 @@ enum Bar {
     /// Compact ring for the menu bar (the real-time 5h view). Square footprint.
     /// Fill arc = used (grows clockwise from 12 o'clock); radial tick = pace
     /// ("where you should be by now" = elapsed fraction). Monochrome template.
-    static func ringImage(used: Double, pace: Double?, diameter: CGFloat = 17, lineWidth: CGFloat = 3) -> NSImage {
+    /// `dimmed` fades the whole ring for a reading that has stopped updating,
+    /// so an old number does not look like a live one at a glance.
+    static func ringImage(
+        used: Double,
+        pace: Double?,
+        dimmed: Bool = false,
+        diameter: CGFloat = 17,
+        lineWidth: CGFloat = 3
+    ) -> NSImage {
+        let fade: CGFloat = dimmed ? 0.4 : 1
         let size = diameter + 4                 // padding so the pace tick can poke out
         let img = NSImage(size: NSSize(width: size, height: size))
         img.lockFocus()
@@ -56,7 +65,7 @@ enum Bar {
         let track = NSBezierPath()
         track.appendArc(withCenter: c, radius: r, startAngle: 0, endAngle: 360)
         track.lineWidth = lineWidth
-        NSColor.black.withAlphaComponent(0.22).setStroke()
+        NSColor.black.withAlphaComponent(0.22 * fade).setStroke()
         track.stroke()
 
         // used arc — start at top (90°), sweep clockwise
@@ -66,7 +75,7 @@ enum Bar {
             arc.lineWidth = lineWidth
             arc.lineCapStyle = .round
             arc.appendArc(withCenter: c, radius: r, startAngle: 90, endAngle: 90 - CGFloat(u) * 360, clockwise: true)
-            NSColor.black.withAlphaComponent(0.92).setStroke()
+            NSColor.black.withAlphaComponent(0.92 * fade).setStroke()
             arc.stroke()
         }
 
@@ -82,7 +91,7 @@ enum Bar {
             tick.line(to: NSPoint(x: c.x + CGFloat(cos(a)) * outer, y: c.y + CGFloat(sin(a)) * outer))
             tick.lineWidth = 1.3
             tick.lineCapStyle = .round
-            NSColor.black.setStroke()
+            NSColor.black.withAlphaComponent(fade).setStroke()
             tick.stroke()
         }
         img.unlockFocus()
