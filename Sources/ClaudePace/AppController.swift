@@ -26,13 +26,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.button?.imagePosition = .imageOnly
 
         refresh()
-        // Common modes keep the clock-relative lines ("N분 전") moving while the
-        // menu is open; a default-mode timer pauses during menu tracking.
-        let t = Timer(timeInterval: 10, repeats: true) { [weak self] _ in
+        // Default run-loop mode on purpose: the timer pauses while the menu is
+        // open, so items are not rebuilt under the pointer. menuWillOpen
+        // redraws once on opening instead.
+        let t = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
             self?.refresh()
         }
         t.tolerance = 5                       // let macOS coalesce wake-ups (energy)
-        RunLoop.main.add(t, forMode: .common)
         timer = t
 
         // A sleeping Mac runs no polls, so the first thing on screen after
