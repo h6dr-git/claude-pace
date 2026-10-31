@@ -72,6 +72,22 @@ AI_USAGE_PRIMARY_PROVIDER=claude .build/release/ClaudePace   # Codex는 codex
 </plist>
 ```
 
+### 업데이트
+새 코드를 받아 다시 빌드한 뒤엔 자동 실행 항목을 **다시 등록**해야 새 실행 파일이 뜸.
+
+```sh
+cd ~/claude-pace   # 클론한 곳
+git pull --ff-only && swift build -c release && {
+  launchctl bootout "gui/$(id -u)/local.claude-pace" 2>/dev/null
+  launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/local.claude-pace.plist
+}
+sleep 3; launchctl print "gui/$(id -u)/local.claude-pace" | grep -E 'state = |pid = '   # state = running이면 끝
+```
+
+다시 빌드하면 실행 파일의 임시(ad-hoc) 서명이 바뀌는데, macOS의 백그라운드 항목 관리는 등록할 때의 서명을 기억해 두고 다른 파일로 보고 실행을 막음. 그래서 `launchctl kickstart -k`로는 **켜져 있던 앱만 꺼지고 새 앱은 안 뜸**(`launchctl print`에 `job state = spawn failed` · `last exit reason = OS_REASON_CODESIGNING` · `needs LWCR update`). bootout → bootstrap으로 다시 등록하면 새 서명으로 기억함. "백그라운드 항목 추가됨" 알림은 정상. 그래도 안 뜨면 시스템 설정 › 일반 › 로그인 항목의 백그라운드 허용에서 껐다 켬.
+
+빌드만 하고 다시 등록하지 않으면, 이미 켜져 있던 앱은 메모리에 올라간 **예전 코드로 계속 돎**. 그 상태로는 고친 내용이 적용되지 않음(아래 「겪은 문제」).
+
 ## 데이터 위치
 `~/Library/Application Support/ClaudePace/` 아래:
 - `snapshot.json` — Claude 스냅샷. 모델별 주간 버킷은 `modelWindows`에 이름 그대로 들어가서 모델명이 바뀌어도 코드 수정 불필요
@@ -101,7 +117,7 @@ AI_USAGE_PRIMARY_PROVIDER=claude .build/release/ClaudePace   # Codex는 codex
 인자·환경 변수·출력·종료 코드는 예전 스크립트와 같음(더해진 것: 위 시간 제한). 모르는 명령이면 앱을 띄우지 않고 사용법을 출력한 뒤 64로 끝남. 목록은 `ClaudePace help`.
 
 ### 스크립트 버전에서 넘어올 때
-- `git pull` 후 `swift build -c release`로 다시 빌드. LaunchAgent는 실행 파일 경로만 맞으면 그대로 씀
+- `git pull` 후 `swift build -c release`로 다시 빌드하고 LaunchAgent를 다시 등록(위 「업데이트」). plist는 실행 파일 경로만 맞으면 그대로 씀
 - statusLine을 등록해 뒀다면 명령을 `…/ClaudePace statusline`으로 바꾸거나 `~/.claude/settings.json`에서 뺌(`bridge/statusline.sh`는 없어짐). 지금은 등록할 필요 없음(위 「statusLine」 참고)
 - 원장·오프셋·처리 기록은 그대로 이어 씀. 이벤트 id·파일 경로 규칙이 예전과 같아서 이미 넣은 기록을 다시 넣지 않음
 
@@ -109,6 +125,7 @@ AI_USAGE_PRIMARY_PROVIDER=claude .build/release/ClaudePace   # Codex는 codex
 - **조회마다 뜨는 권한 팝업**: launchd처럼 작업 디렉터리 없이 `claude`를 실행하면 Claude Code가 `$HOME`을 프로젝트 루트로 보고 훑다가 `~/Library/Application Support/*` 같은 보호 영역에 닿아, 조회할 때마다 "claude를 허용하시겠습니까?" 팝업이 뜸 → 빈 디렉터리(`~/.claudepace/cwd`)에서 실행하고, MCP 서버·크롬 브리지를 끈 채(`--strict-mcp-config --mcp-config '{"mcpServers":{}}' --no-chrome`) 조회.
 - **로그인돼 있는데 로그아웃으로 보고**: `USER` 환경 변수가 없으면 CLI가 키체인의 로그인 정보를 못 읽음. launchd는 환경을 거의 안 넘겨서, 앱이 `HOME`·`USER`·`PATH`를 직접 넘김.
 - **세션 목록이 조회 찌꺼기로 뒤덮임**: 180초마다 조회하니 이틀 만에 빈 세션 파일이 314개 쌓여 실제 세션 목록이 묻힘 → `--no-session-persistence`.
+- **하루 가까이 멈춘 숫자가 경고 없이 보임**(2026-10-31): 저장소를 새로 받아 다시 빌드했지만, 메뉴바에는 그 전부터 켜져 있던 스크립트 버전 앱이 계속 돌고 있었음. 그 앱이 부르던 `tools/poll-usage.sh`가 새 저장소엔 없어서 조회가 조용히 멈췄고, 조회 실패가 아니라 시도 자체가 없으니 「⚠ 수집 중단」도 안 뜸. 리셋이 지난 5시간 창은 0%로 굴려져 실제와 다른 숫자까지 보임 → 값의 나이로 「⚠ 갱신 멈춤」을 띄우고, 지난 창은 0% 대신 "창 끝남"으로 표시(#3). 고친 빌드를 띄우려던 `kickstart -k`는 서명 불일치로 실패 → 다시 등록(위 「업데이트」).
 
 팝업 재발 확인(zsh 내장 `log`와 겹치므로 전체 경로로):
 ```sh
