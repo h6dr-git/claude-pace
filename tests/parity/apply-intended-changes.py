@@ -75,6 +75,60 @@ CHANGES = [
         "        if best is not None:\n"
         "            return best\n",
     ),
+    (
+        # Every poll whose output has a session line, readable or not, stores
+        # its capturedAt as `fiveHourSeenAt`: when a 5-hour window was last
+        # possibly open. The "no 5-hour limit" conclusion judges the previous
+        # poll by it (that conclusion is not mirrored: it never fires here).
+        "tools/poll-usage.sh",
+        "new['fiveHour'] = window(cur.get('fiveHour') or {}, five, five_reset)\n",
+        "new['fiveHour'] = window(cur.get('fiveHour') or {}, five, five_reset)\n"
+        "session_line = re.search(r'^\\s*Current session\\b', out, re.M | re.I) is not None\n"
+        "if session_line:\n"
+        "    new['fiveHourSeenAt'] = new['capturedAt']\n",
+    ),
+    (
+        # A poll without a session line keeps the stored 5-hour window, but a
+        # percentage whose reset is still ahead loses its number (no poll
+        # printed it as current: the limit may have gone mid-window) and keeps
+        # the reset. A window without a reset and without `fiveHourSeenAt`
+        # (stored before it existed) is dated by the previous poll instead, so
+        # that it can expire.
+        "tools/poll-usage.sh",
+        "new['sevenDay'] = window(cur.get('sevenDay') or {}, week, week_reset)\n",
+        "\n"
+        "def finite(value):\n"
+        "    return (isinstance(value, (int, float)) and not isinstance(value, bool)\n"
+        "            and value == value and abs(value) != float('inf'))\n"
+        "\n"
+        "if not session_line:\n"
+        "    old = cur.get('fiveHour')\n"
+        "    old_reset = old.get('resets_at') if isinstance(old, dict) else None\n"
+        "    if finite(old_reset) and old_reset > time.time():\n"
+        "        new['fiveHour'] = dict(old, used_percentage=None)\n"
+        "    elif (old is not None and old != {} and not finite(old_reset)\n"
+        "          and not finite(cur.get('fiveHourSeenAt')) and finite(cur.get('capturedAt'))):\n"
+        "        new['fiveHourSeenAt'] = cur['capturedAt']\n"
+        "new['sevenDay'] = window(cur.get('sevenDay') or {}, week, week_reset)\n",
+    ),
+    (
+        # A poll that printed the all-models weekly line blanks the percentage
+        # of every stored model bucket it did not print (the reset stays),
+        # also when it printed no bucket at all: `/usage` stopped reporting
+        # it, so it must not stay a live reading. Without that line the
+        # buckets stay as they were; printed buckets merge as before.
+        "tools/poll-usage.sh",
+        "if model_windows:\n"
+        "    merged = dict(cur.get('modelWindows') or {})\n",
+        "stored = cur.get('modelWindows')\n"
+        "merged = dict(stored) if isinstance(stored, dict) else {}\n"
+        "if week is not None and merged:\n"
+        "    for name, w in list(merged.items()):\n"
+        "        if name not in model_windows and isinstance(w, dict):\n"
+        "            merged[name] = dict(w, used_percentage=None)\n"
+        "    new['modelWindows'] = merged\n"
+        "if model_windows:\n",
+    ),
 ]
 
 

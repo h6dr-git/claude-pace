@@ -226,9 +226,10 @@ enum ClaudeUsageCollector {
         }
         // A session line that could not be read still means a 5-hour window
         // may be open, so the stored one keeps its reset only while that is
-        // ahead. A passed reset (or none) would read as ended: in the menu as
-        // "no window open", and to the next poll as "none open at the
-        // previous poll", the ground for concluding there is no 5-hour limit.
+        // ahead. A passed reset would read as ended: in the menu as "no window
+        // open", and to later polls as "none open", the ground for concluding
+        // there is no 5-hour limit. Without a reset the window counts as open
+        // until 5 hours after this poll (`fiveHourSeenAt`, see `noWindowOpen`).
         func possiblyOpen(_ old: JSONValue) -> JSONValue {
             if let reset = finiteNumber(old.objectValue?["resets_at"]), reset > now.timeIntervalSince1970 {
                 return old
@@ -249,16 +250,38 @@ enum ClaudeUsageCollector {
         snapshot["fiveHour"] = sessionLine && five == nil
             ? possiblyOpen(oldWindow("fiveHour"))
             : window(oldWindow("fiveHour"), five, fiveReset)
+        // A session line, readable or not, means a 5-hour window may be open
+        // now. Later polls judge "none open at the previous poll" by this
+        // time too, not by the stored reset alone.
+        if sessionLine {
+            snapshot["fiveHourSeenAt"] = .int(capturedAt)
+        }
         snapshot["sevenDay"] = window(oldWindow("sevenDay"), week, weekReset)
 
         // Per-model weekly buckets are keyed by the name `/usage` printed, so a
         // renamed or new model shows up without a code change. Buckets missing
         // a reset inherit the all-models weekly reset — the same window.
-        if !modelWindows.isEmpty {
-            var merged = JSONObject()
-            if let previous = current["modelWindows"], previous.isPythonTruthy, case .object(let object) = previous {
-                merged = object
+        var buckets = JSONObject()
+        if let previous = current["modelWindows"], previous.isPythonTruthy, case .object(let object) = previous {
+            buckets = object
+        }
+        // A bucket left out next to the all-models line is no reading any
+        // more: `/usage` stopped printing it (a retired or renamed model, or
+        // one it does not list right now). Its percentage goes and its reset
+        // stays, so it no longer reads as current or draws the ring; a poll
+        // that prints it again brings it back. Output without the all-models
+        // line says nothing about the buckets, and they stay as they were.
+        if week != nil, !buckets.isEmpty {
+            let printed = Set(modelWindows.map { $0.name })
+            for (name, value) in buckets.entries where !printed.contains(name) {
+                guard case .object(var bucket) = value else { continue }
+                bucket["used_percentage"] = .null
+                buckets[name] = .object(bucket)
             }
+            snapshot["modelWindows"] = .object(buckets)
+        }
+        if !modelWindows.isEmpty {
+            var merged = buckets
             for bucket in modelWindows {
                 var resetValue = JSONValue.null
                 if let reset = bucket.reset ?? weekReset {
@@ -283,6 +306,8 @@ enum ClaudeUsageCollector {
         )
         if absentSince != nil {
             snapshot["fiveHour"] = .null
+        } else if !sessionLine {
+            settleWithoutSessionLine(&snapshot, previous: current, at: now)
         }
         snapshot["fiveHourAbsentSince"] = absentSince
         snapshot["source"] = .string("usage-poll")
@@ -313,11 +338,11 @@ enum ClaudeUsageCollector {
     /// opened a window lasting 5 hours from its first message, still open at
     /// the second poll, which would have printed the session line. (A window
     /// already open at the first poll could have taken the usage and closed
-    /// since, which is why none may be open then.) Both bounds keep
-    /// `evidenceSlack` clear: the last 5-hour window must have ended 10
-    /// minutes before the first poll, and the polls be 10 minutes under 5
-    /// hours apart. Once concluded it holds, with no new evidence needed,
-    /// until a poll prints a session line again.
+    /// since, which is why none may be open then, see `noWindowOpen`.) Both
+    /// bounds keep `evidenceSlack` clear: the last 5-hour window must have
+    /// ended 10 minutes before the first poll, and the polls be 10 minutes
+    /// under 5 hours apart. Once concluded it holds, with no new evidence
+    /// needed, until a poll prints a session line again.
     private static func fiveHourAbsence(
         before previous: JSONObject,
         after updated: JSONObject,
@@ -333,7 +358,8 @@ enum ClaudeUsageCollector {
         guard let then = finiteNumber(previous["capturedAt"]) else { return nil }
         let elapsed = Double(now) - then
         guard elapsed > 0, elapsed < fiveHours - evidenceSlack,
-              noWindowOpen(previous["fiveHour"], at: then - evidenceSlack) else { return nil }
+              noWindowOpen(previous["fiveHour"], seenAt: finiteNumber(previous["fiveHourSeenAt"]), at: then)
+        else { return nil }
         let oldBuckets = previous["modelWindows"]?.objectValue
         let newBuckets = updated["modelWindows"]?.objectValue
         let used = usageGrew(previous["sevenDay"], updated["sevenDay"])
@@ -341,20 +367,83 @@ enum ClaudeUsageCollector {
         return used ? .int(now) : nil
     }
 
-    /// No 5-hour window was open at `time`: none stored, or one whose reset
-    /// had passed by then. A percentage without a readable reset may belong
-    /// to a window still open, so it proves nothing; that is also what a
-    /// session line that could not be read leaves (see `possiblyOpen`).
-    private static func noWindowOpen(_ window: JSONValue?, at time: Double) -> Bool {
+    /// No 5-hour window was open at the previous poll, taken at `then`: the
+    /// last one known had ended `evidenceSlack` before it.
+    ///
+    /// Two things bound when that was: the last poll that printed a session
+    /// line (`seenAt`, a window may have been open then), and the stored
+    /// window's reset, or for one without a reset (a percentage alone, or
+    /// what an unreadable session line leaves) 5 hours after `seenAt`, since
+    /// no window lasts longer. The later of them counts. A previous poll that
+    /// printed the line itself proves nothing, whatever its reset says: the
+    /// Mac's clock may run fast, or the reset fall in the hour a clock change
+    /// repeats (stored at its first occurrence). No window stored and no line
+    /// ever seen: none was open (a fresh install).
+    private static func noWindowOpen(_ window: JSONValue?, seenAt: Double?, at then: Double) -> Bool {
+        if let seenAt, seenAt >= then { return false }
+        let end: Double?
+        switch storedFiveHour(window) {
+        case .none:
+            end = nil
+        case .resets(let reset):
+            end = reset
+        case .unbounded:
+            // Undated so far; `settleWithoutSessionLine` dates it during this poll.
+            guard let seenAt else { return false }
+            end = seenAt + fiveHours
+        }
+        guard let bound = [end, seenAt].compactMap({ $0 }).max() else { return true }
+        return bound <= then - evidenceSlack
+    }
+
+    /// A stored 5-hour window, as far as "was one open?" goes.
+    private enum StoredFiveHour {
+        /// None stored: missing, null or `{}`.
+        case none
+        /// One with a known reset.
+        case resets(Double)
+        /// One without a usable reset: a percentage alone, what an unreadable
+        /// session line leaves, or anything else that is not a window.
+        case unbounded
+    }
+
+    private static func storedFiveHour(_ window: JSONValue?) -> StoredFiveHour {
         switch window {
         case nil, .null?:
-            return true
+            return .none
         case .object(let object)?:
-            if object.isEmpty { return true }
-            guard let reset = finiteNumber(object["resets_at"]) else { return false }
-            return reset <= time
+            if object.isEmpty { return .none }
+            return finiteNumber(object["resets_at"]).map(StoredFiveHour.resets) ?? .unbounded
         default:
-            return false
+            return .unbounded
+        }
+    }
+
+    /// A poll that printed no session line and concluded nothing keeps the
+    /// stored 5-hour window, with two exceptions.
+    ///
+    /// A percentage whose reset is still ahead was not printed this time (the
+    /// limit may have gone mid-window, or the line is just missing), so it
+    /// loses its number: none may read as current that no poll printed as
+    /// current. Its reset stays and still marks the window as possibly open
+    /// for `noWindowOpen`; that it went missing proves nothing by itself, as
+    /// an early reset on an account with the limit looks the same. And a
+    /// window without a reset, from before `fiveHourSeenAt` existed, is dated
+    /// by the previous poll, no earlier than its real sighting, so that it
+    /// ends 5 hours on instead of blocking the conclusion for good.
+    private static func settleWithoutSessionLine(
+        _ snapshot: inout JSONObject, previous: JSONObject, at now: Date
+    ) {
+        switch storedFiveHour(previous["fiveHour"]) {
+        case .resets(let reset) where reset > now.timeIntervalSince1970:
+            guard case .object(var window)? = snapshot["fiveHour"] else { return }
+            window["used_percentage"] = .null
+            snapshot["fiveHour"] = .object(window)
+        case .unbounded where finiteNumber(previous["fiveHourSeenAt"]) == nil:
+            guard let then = previous["capturedAt"], finiteNumber(then) != nil else { return }
+            snapshot["fiveHourSeenAt"] = then
+        default:
+            break
         }
     }
 

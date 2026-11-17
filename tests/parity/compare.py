@@ -59,8 +59,10 @@ def normalize(value, relative):
         value = dict(value)
         value.pop("generatedAt", None)
         if name in ("snapshot.json", "snapshot.json.tmp", "claude-collector-state.json", "codex-snapshot.json"):
-            if "capturedAt" in value:
-                value["capturedAt"] = "<time>"
+            # A poll's capturedAt, and poll times the snapshot keeps.
+            for key in ("capturedAt", "fiveHourSeenAt", "fiveHourAbsentSince"):
+                if key in value:
+                    value[key] = "<time>"
         if name == "codex-snapshot.json" and isinstance(value.get("accountUsageCapturedAt"), (int, float)):
             value["accountUsageCapturedAt"] = "<time>"
         if value.get("source") == "claude-statusline" and str(value.get("event_id", "")).startswith("claude-statusline:"):
