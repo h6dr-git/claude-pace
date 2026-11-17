@@ -155,6 +155,12 @@ enum SessionIngest {
     /// returned with its position in the file, for the caller to judge. The
     /// file is read in pieces, so the first pass over a long session never
     /// holds the whole tail (and a copy of it) in memory.
+    ///
+    /// A line can span many pieces (Claude lines can be megabytes), so each
+    /// byte is searched for a newline once: `pending`, the line so far, never
+    /// holds one, and only the piece just read is searched. It is copied only
+    /// after a newline, when what is left came in that piece. Searching and
+    /// copying all of `pending` for every piece made a 50 MB line take 2 s.
     private static func readLines(
         of file: String,
         from offset: Int,
@@ -170,14 +176,18 @@ enum SessionIngest {
         var pending = Data()
         var position = offset
         while let chunk = try? handle.read(upToCount: 1 << 20), !chunk.isEmpty {
+            var searchFrom = pending.endIndex
             pending.append(chunk)
             var start = pending.startIndex
-            while let newline = pending[start...].firstIndex(of: 0x0A) {
+            while let newline = pending[searchFrom...].firstIndex(of: 0x0A) {
                 body(pending[start..<newline])
                 start = pending.index(after: newline)
+                searchFrom = start
             }
-            position += start - pending.startIndex
-            pending = Data(pending[start...])
+            if start != pending.startIndex {
+                position += start - pending.startIndex
+                pending = Data(pending[start...])
+            }
         }
         return pending.isEmpty ? nil : (pending, position)
     }

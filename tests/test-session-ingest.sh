@@ -2,9 +2,9 @@
 # Session ingest and a line that is still being written when it runs. The
 # scripts stored the file size as the next offset, so the rest of such a line
 # was read on its own next time and the event was lost. Now the line is read
-# again, whole, once it is finished — and no event is ingested twice. When a
-# writer never finished its line and the next line got glued onto it, that
-# next line is still ingested.
+# again, whole, once it is finished — and no event is ingested twice, however
+# many reads the line spans. When a writer never finished its line and the
+# next line got glued onto it, that next line is still ingested.
 set -uo pipefail
 
 repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
@@ -89,9 +89,12 @@ check "claude: nothing is ingested twice" 2 "$(records "$home" claude-session)"
 # complete line is read out of the glued one, once, and only if the source
 # would take it as a line of its own.
 
-# A JSON string with brackets and braces, escaped quotes and backslash runs on
-# both sides of a quote; it ends in "{", so `{"` turns up inside it too.
-tricky='"} ] [ { \" \\ \\\" end\\ {"'
+# Brackets and braces inside strings, and an odd number of escaped quotes with
+# brackets after the first: a scan that took every quote for a delimiter would
+# leave the value thinking it is inside a string. Backslash runs come on both
+# sides of a quote, and the second string ends in a backslash, so its closing
+# quote has two before it. The first ends in "{", so `{"` turns up inside it.
+tricky='["5\" } ] [ { \" \\ \\\" end\\ {","C:\\"]'
 
 codex_event() {  # codex_event <n>: a token_count line with n total tokens
   printf '{"timestamp":"2026-10-28T03:%02d:00Z","type":"event_msg","payload":{"type":"token_count","note":%s,"info":{"total_token_usage":{"total_tokens":%d},"last_token_usage":{"total_tokens":1}}}}' "$(($1 % 60))" "$tricky" "$1"
@@ -193,8 +196,44 @@ offsets="$home/Library/Application Support/ClaudePace/.claude-session-offsets"
 ingest=ingest_claude source=claude-session
 glued_checks claude claude_event claude_other '"output_tokens":%d,' '"usage":'
 
+# --- A long line read in pieces ----------------------------------------------
+# A line of several MiB spans many reads. Written in two parts, it waits for
+# its newline, then is ingested once along with the line after it. It is
+# exactly 3 MiB, so the run that finishes it finds its newline as the first
+# byte of a read (reads are 1 MiB). A long complete last line without a newline
+# is taken at once.
+long_line() {  # long_line <output tokens> <bytes>: an assistant turn that long
+  local front back
+  front="$(printf '{"type":"assistant","requestId":"req_long_%d","timestamp":"2026-10-28T05:00:00Z","message":{"model":"claude-opus-5-5","content":[{"type":"text","text":"' "$1")"
+  back="$(printf '"}],"usage":{"input_tokens":1,"output_tokens":%d}}}' "$1")"
+  printf '%s' "$front"
+  head -c $(($2 - ${#front} - ${#back})) /dev/zero | tr '\0' x
+  printf '%s' "$back"
+}
+home="$scratch/claude-long"
+mkdir -p "$home/.claude/projects/-Users-me-project"
+file="$home/.claude/projects/-Users-me-project/long.jsonl"
+long="$scratch/long-line"
+marker='"output_tokens":%d,'
+long_line 300 $((3 << 20)) > "$long"
+cut=$(((2 << 20) + 777))
+{ claude_line req_a 1; echo; head -c "$cut" "$long"; } > "$file"
+ingest_claude
+check "long line: it waits for its newline" "1 0" "$(records "$home" claude-session) $(took 300)"
+{ tail -c +$((cut + 1)) "$long"; echo; claude_line req_b 2; echo; } >> "$file"
+ingest_claude
+check "long line: once finished it is ingested, once" "3 1 1" "$(records "$home" claude-session) $(took 300) $(took 2)"
+ingest_claude
+check "long line: a later run adds nothing" 3 "$(records "$home" claude-session)"
+long_line 301 $(((3 << 20) + 4321)) >> "$file"
+ingest_claude
+check "long line: a complete one without a newline is taken at once" "4 1" "$(records "$home" claude-session) $(took 301)"
+echo >> "$file"
+ingest_claude
+check "long line: its newline adds nothing" 4 "$(records "$home" claude-session)"
+
 if [ "$failures" -ne 0 ]; then
   echo "FAIL: $failures session-ingest assertions failed" >&2
   exit 1
 fi
-echo "PASS: session ingest picks up lines finished between runs and lines glued onto broken ones"
+echo "PASS: session ingest picks up lines finished between runs, long lines read in pieces and lines glued onto broken ones"
