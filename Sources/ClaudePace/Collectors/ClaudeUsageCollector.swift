@@ -310,6 +310,9 @@ enum ClaudeUsageCollector {
             sessionLine: sessionLine,
             at: capturedAt
         )
+        if !sessionLine {
+            moveSightingBeforePoll(&snapshot, previous: current, capturedAt: capturedAt)
+        }
         if absentSince != nil {
             snapshot["fiveHour"] = .null
         } else if !sessionLine {
@@ -425,41 +428,52 @@ enum ClaudeUsageCollector {
         }
     }
 
+    /// No sighting is as late as a poll that printed no session line. One
+    /// stored that late (taken while the Mac's clock ran fast, since put
+    /// right) becomes the second before this poll: still about the latest a
+    /// window may have been open, but no longer a block on the conclusion for
+    /// as long as the clock was off. So only a poll that printed the line has
+    /// `fiveHourSeenAt` equal to its own capturedAt, which is how the menu
+    /// tells an unreadable session line from a missing one. (Every poll
+    /// without the line, whether it concludes, holds an absence or neither.)
+    private static func moveSightingBeforePoll(
+        _ snapshot: inout JSONObject, previous: JSONObject, capturedAt: Int
+    ) {
+        if let seen = finiteNumber(previous["fiveHourSeenAt"]), seen > Double(capturedAt - 1) {
+            snapshot["fiveHourSeenAt"] = .int(capturedAt - 1)
+        }
+    }
+
     /// A poll that printed no session line and concluded nothing keeps the
     /// stored 5-hour window, with two exceptions.
     ///
-    /// A percentage whose reset is still ahead was not printed this time (the
-    /// limit may have gone mid-window, or the line is just missing), so it
-    /// loses its number: none may read as current that no poll printed as
-    /// current. Its reset stays and still marks the window as possibly open
-    /// for `noWindowOpen`; that it went missing proves nothing by itself, as
-    /// an early reset on an account with the limit looks the same. And a
-    /// window without a reset, from before `fiveHourSeenAt` existed, is dated
-    /// by the previous poll, no earlier than its real sighting, so that it
-    /// ends 5 hours on instead of blocking the conclusion for good.
-    ///
-    /// No sighting is as late as this poll, which printed no session line.
-    /// One stored that late (taken while the Mac's clock ran fast, since put
-    /// right) becomes the second before this poll: still about the latest a
-    /// window may have been open, but no longer a block on the conclusion for
-    /// as long as the clock was off. Only a poll that printed the line has
-    /// `fiveHourSeenAt` equal to its own capturedAt, which is how the menu
-    /// tells an unreadable session line from a missing one.
+    /// A percentage was not printed this time while its window may still be
+    /// open: its reset is still ahead (the limit may have gone mid-window, or
+    /// the line is just missing), or it never had one. It loses its number:
+    /// none may read as current that no poll printed as current. A reset
+    /// ahead stays and still marks the window as possibly open for
+    /// `noWindowOpen`; that it went missing proves nothing by itself, as an
+    /// early reset on an account with the limit looks the same. A window that
+    /// ended stays as it is, for the menu to say when. And a window without a
+    /// reset, from before `fiveHourSeenAt` existed, is dated by the previous
+    /// poll, no earlier than its real sighting and before this one, so that
+    /// it ends 5 hours on instead of blocking the conclusion for good.
     private static func settleWithoutSessionLine(
         _ snapshot: inout JSONObject, previous: JSONObject, at now: Date
     ) {
-        let capturedAt = Int(now.timeIntervalSince1970)
-        let latestSighting = capturedAt - 1
-        if let seen = finiteNumber(previous["fiveHourSeenAt"]), seen > Double(latestSighting) {
-            snapshot["fiveHourSeenAt"] = .int(latestSighting)
-        }
+        let latestSighting = Int(now.timeIntervalSince1970) - 1
         switch storedFiveHour(previous["fiveHour"]) {
         case .resets(let reset) where reset > now.timeIntervalSince1970:
             guard case .object(var window)? = snapshot["fiveHour"] else { return }
             window["used_percentage"] = .null
             snapshot["fiveHour"] = .object(window)
-        case .unbounded where finiteNumber(previous["fiveHourSeenAt"]) == nil:
-            guard let then = previous["capturedAt"], let at = finiteNumber(then) else { return }
+        case .unbounded:
+            if case .object(var window)? = previous["fiveHour"] {
+                window["used_percentage"] = .null
+                snapshot["fiveHour"] = .object(window)
+            }
+            guard finiteNumber(previous["fiveHourSeenAt"]) == nil,
+                  let then = previous["capturedAt"], let at = finiteNumber(then) else { return }
             snapshot["fiveHourSeenAt"] = at > Double(latestSighting) ? .int(latestSighting) : then
         default:
             break

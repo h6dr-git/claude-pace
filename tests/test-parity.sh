@@ -335,9 +335,9 @@ print(month, t.day, "at", "%d:50%s" % (t.hour % 12 or 12, "am" if t.hour < 12 el
   printf '%s' '{"capturedAt": 1, "fiveHour": {"used_percentage": 50, "resets_at": 1700000000, "extra": "kept"}, "model": "Opus", "raw_rate_limits": {"x": 1}, "sevenDayOpus": null}' > "$app/snapshot.json"
   claude_poll full full.txt
   # A poll without a session line keeps the time the one before saw it
-  # (fiveHourSeenAt). A second on, that can never be this poll's own
-  # capturedAt, which compare.py tells apart from any other poll time.
-  sleep 1
+  # (fiveHourSeenAt), moved to the second before itself if that is as late:
+  # never its own capturedAt, which compare.py tells apart from any other
+  # poll time.
   claude_poll weekonly weekonly.txt
   claude_poll models models.txt
   claude_poll variants variants.txt
@@ -356,17 +356,15 @@ print(month, t.day, "at", "%d:50%s" % (t.hour % 12 or 12, "am" if t.hour < 12 el
   printf '%s' '[1,2,3]' > "$app/snapshot.json"
   claude_poll array-snapshot models.txt
   # The session line gone before its reset: the 5-hour percentage goes, the
-  # reset stays (a second on, as after `full`).
+  # reset stays.
   claude_poll session-open open.txt
-  sleep 1
   claude_poll session-gone weekonly.txt
   # A 5-hour percentage without a reset, stored before fiveHourSeenAt: a poll
   # without a session line dates it by the poll before.
   printf '%s' '{"capturedAt": 1793000000, "fiveHour": {"used_percentage": 3}}' > "$app/snapshot.json"
   claude_poll legacy-window weekonly.txt
-  # ...no later than this poll, though, when that poll was stamped ahead of
-  # it (a clock that ran fast); and a sighting stored ahead becomes this
-  # poll's time.
+  # ...but the second before this poll when that poll was stamped as late
+  # (a clock that ran fast); a sighting stored that late moves the same way.
   printf '%s' '{"capturedAt": 4000000000, "fiveHour": {"used_percentage": 3}}' > "$app/snapshot.json"
   claude_poll legacy-window-ahead weekonly.txt
   printf '%s' '{"capturedAt": 1793000000, "fiveHourSeenAt": 4000000000, "fiveHour": {"used_percentage": 9, "resets_at": 1793000000}}' > "$app/snapshot.json"

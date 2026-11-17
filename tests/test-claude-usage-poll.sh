@@ -385,10 +385,11 @@ run_poll "$scratch/week61.txt"
 check "window open before: kept" "$(canonical "$closed")" "$(json fiveHour)"
 check "window open before: not concluded" "<missing>" "$(json fiveHourAbsentSince)"
 
-# --- 22) the same for a 5-hour percentage whose reset could not be read
+# --- 22) the same for a 5-hour percentage whose reset could not be read; its
+# number goes, as no poll printed it as current
 previous_poll 180 '{"used_percentage": 40, "resets_at": null}'
 run_poll "$scratch/week61.txt"
-check "unknown reset before: kept" '{"resets_at": null, "used_percentage": 40}' "$(json fiveHour)"
+check "unknown reset before: percentage blanked" '{"resets_at": null, "used_percentage": null}' "$(json fiveHour)"
 check "unknown reset before: not concluded" "<missing>" "$(json fiveHourAbsentSince)"
 
 # --- 23) growth against another weekly reset compares two different windows
@@ -577,12 +578,12 @@ check "unreadable line 5h11m before the previous poll: since this poll" "$(json 
 
 # --- 35) a 5-hour percentage without a reset from before fiveHourSeenAt: the
 # first poll without a session line dates its sighting by the previous poll
-# (no earlier than the real one), so it, too, ends 5 hours on
+# (no earlier than the real one), so it, too, ends 5 hours on; its number goes
 legacy_window='{"used_percentage": 3}'
 previous_poll 180 "$legacy_window"
 t0="$(json capturedAt)"
 run_poll "$scratch/week61.txt"
-check "legacy 5h reading: kept" "$(canonical "$legacy_window")" "$(json fiveHour)"
+check "legacy 5h reading: percentage blanked" '{"used_percentage": null}' "$(json fiveHour)"
 check "legacy 5h reading: not concluded" "<missing>" "$(json fiveHourAbsentSince)"
 check "legacy 5h reading: dated by the previous poll" "$t0" "$(json fiveHourSeenAt)"
 t0=$(($(date +%s) - 180))
@@ -649,6 +650,13 @@ check "legacy 5h reading, previous poll ahead: dated the second before this poll
   "$(($(json capturedAt) - 1))" "$(json fiveHourSeenAt)"
 menu="$(HOME="$fake_home" AI_USAGE_PRIMARY_PROVIDER=claude "$bin" menu-preview </dev/null)"
 check "legacy 5h reading, previous poll ahead: no unreadable line claimed" "0" "$(grep -c '해석하지 못함' <<<"$menu")"
+# ...also on a poll that only holds an absence already concluded
+previous_poll 180 null $(($(date +%s) + 86400))
+held_since=$(($(date +%s) - 3600))
+edit_snapshot "fiveHourAbsentSince=$held_since"
+run_poll "$scratch/week61.txt"
+check "absence held, sighting stored ahead: still held" "$held_since" "$(json fiveHourAbsentSince)"
+check "absence held, sighting stored ahead: the second before this poll" "$(($(json capturedAt) - 1))" "$(json fiveHourSeenAt)"
 # An open window whose sighting was stored ahead: blanked, and the menu gives
 # the missing line as the reason, with the window's end
 open_at=$(($(date +%s) + 7200))
@@ -671,6 +679,51 @@ previous_poll 180 "{\"used_percentage\": 40, \"resets_at\": $((t0 - 3600)).0}" $
 edit_snapshot "capturedAt=$t0"
 run_poll "$scratch/week61.txt"
 check "session line exactly 10 minutes before the previous poll: since this poll" "$(json capturedAt)" "$(json fiveHourAbsentSince)"
+
+# --- 39) a sighting in this very second (a poll with the line and one without,
+# back to back) moves too: only a poll that printed the line keeps
+# fiveHourSeenAt at its own capturedAt. The poll starts as a second turns, so
+# that it lands in it; tried until it does, and a failure if it never does.
+same_second() {  # same_second <name> <fiveHour JSON> <key the second goes in>
+  local attempt t
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    previous_poll 180 "$2"
+    t=$(($(date +%s) + 1))
+    edit_snapshot "$3=$t"
+    python3 -c "import time; time.sleep(max(0.0, $t - time.time()))"
+    run_poll "$scratch/week61.txt"
+    if [ "$(json capturedAt)" = "$t" ]; then
+      check "$1: the second before this poll" "$((t - 1))" "$(json fiveHourSeenAt)"
+      return
+    fi
+  done
+  check "$1: a poll that lands in its second" "landed" "missed 10 times"
+}
+same_second "sighting in this poll's second" "$ended" fiveHourSeenAt
+same_second "legacy 5h reading, previous poll in this second" "$legacy_window" capturedAt
+
+# --- 40) the menu's reason for a 5-hour section without a number, end to end:
+# a line whose reset could not be read, then none (the window may stay open 5
+# hours from that line), and a line whose reset lies out of range
+menu_line() {  # menu_line <name> <expected line>
+  local menu
+  menu="$(HOME="$fake_home" AI_USAGE_PRIMARY_PROVIDER=claude "$bin" menu-preview </dev/null)"
+  check "$1" "1" "$(grep -cxF -- "$2" <<<"$menu")"
+}
+previous_poll 180 "$ended"
+printf '%s\n' 'Current session: 3% used' \
+  "Current week (all models): 61% used · resets $weekly_reset (Asia/Seoul)" > "$scratch/session-noreset.txt"
+run_poll "$scratch/session-noreset.txt"
+menu_line "reset not read: menu" "사용률 값 없음 — 5시간 줄의 리셋 시각을 해석하지 못함"
+sleep 1
+run_poll "$scratch/week61.txt"
+check "reset not read, then no line: percentage blanked" '{"resets_at": null, "used_percentage": null}' "$(json fiveHour)"
+menu_line "reset not read, then no line: menu" "사용률 값 없음 — 마지막 조회에 5시간 줄이 없음"
+IFS=$'\t' read -r far_reset _ < <(reset_at $((3 * 86400)) minutes)
+printf '%s\n' "Current session: 30% used · resets $far_reset (Asia/Seoul)" \
+  "Current week (all models): 61% used · resets $weekly_reset (Asia/Seoul)" > "$scratch/session-far.txt"
+run_poll "$scratch/session-far.txt"
+menu_line "reset out of range: menu" "사용률 값 없음 — 5시간 줄의 값이 범위를 벗어남"
 
 if [ "$failures" -ne 0 ]; then
   echo "FAIL: $failures claude-usage-poll assertions failed" >&2
