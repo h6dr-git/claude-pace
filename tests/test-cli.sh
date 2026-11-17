@@ -50,6 +50,16 @@ run_bounded 10 help
 status=$?
 [ "$status" -eq 0 ] || fail "help exited $status"
 grep -q '^usage: ClaudePace' "$scratch/out" || fail "help: no usage text on stdout"
+grep -q '^  menu-preview ' "$scratch/out" || fail "help: menu-preview not listed"
+
+# menu-preview only reads: it prints the menu and exits, and the empty HOME
+# stays empty.
+run_bounded 10 menu-preview
+status=$?
+[ "$status" -eq 0 ] || fail "menu-preview exited $status (124: still running, the app started)"
+grep -q '^ring: ' "$scratch/out" || fail "menu-preview: no ring line: $(head -c 300 "$scratch/out")"
+grep -q '^tooltip: ' "$scratch/out" || fail "menu-preview: no tooltip line"
+[ -z "$(find "$scratch/home" -mindepth 1 -print)" ] || fail "menu-preview wrote into HOME"
 
 # A real command still runs to completion.
 run_bounded 30 usage-history-summary

@@ -138,10 +138,24 @@ enum ClaudeUsageCollector {
         options: [.caseInsensitive]
     )
 
+    /// A session limit line, readable or not. Only output without one can
+    /// count towards "this account has no 5-hour limit".
+    private static let sessionHeading = try! NSRegularExpression(
+        pattern: #"^\s*Current session\b"#,
+        options: [.anchorsMatchLines, .caseInsensitive]
+    )
+
     private static let fiveHours: Double = 5 * 3600
-    private static let oneWeek: Double = 7 * 24 * 3600
+
+    /// How far clear of both bounds the "no 5-hour limit" evidence must be.
+    /// capturedAt is stamped once the CLI has returned, a little after
+    /// `/usage` looked; `/usage` prints resets to the minute; and usage can be
+    /// counted a little late. Ten minutes covers all three and costs nothing
+    /// on an account without the limit, whose last window ended long ago.
+    private static let evidenceSlack: Double = 10 * 60
 
     private static func update(_ paths: AppPaths, from output: String, io: CommandIO) -> Int32 {
+        let now = Date()
         let text = output as NSString
         let whole = NSRange(location: 0, length: text.length)
         func group(_ match: NSTextCheckingResult, _ index: Int) -> String? {
@@ -153,8 +167,9 @@ enum ClaudeUsageCollector {
         var fiveReset: Double?
         if let match = sessionPattern.firstMatch(in: output, range: whole) {
             five = group(match, 1).flatMap { Int($0) }
-            fiveReset = UsageResetTime.epoch(text: group(match, 2), timeZoneName: group(match, 3), windowLength: fiveHours)
+            fiveReset = UsageResetTime.epoch(text: group(match, 2), timeZoneName: group(match, 3), now: now)
         }
+        let sessionLine = sessionHeading.firstMatch(in: output, range: whole) != nil
 
         var week: Int?
         var weekReset: Double?
@@ -162,7 +177,7 @@ enum ClaudeUsageCollector {
         for match in weekPattern.matches(in: output, range: whole) {
             let name = (group(match, 1) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard let used = group(match, 2).flatMap({ Int($0) }) else { continue }
-            let reset = UsageResetTime.epoch(text: group(match, 3), timeZoneName: group(match, 4), windowLength: oneWeek)
+            let reset = UsageResetTime.epoch(text: group(match, 3), timeZoneName: group(match, 4), now: now)
             if ["all models", "all model", "all"].contains(name.lowercased()) {
                 week = used
                 weekReset = reset
@@ -200,7 +215,7 @@ enum ClaudeUsageCollector {
             if let reset {
                 updated["resets_at"] = .number(JSONNumber(pythonFloat: reset))
             } else if case .number(let previous)? = updated["resets_at"],
-                      previous.doubleValue < Date().timeIntervalSince1970 {
+                      previous.doubleValue < now.timeIntervalSince1970 {
                 // A fresh percentage without a readable reset must not inherit
                 // one that has already passed: that instant belongs to a window
                 // that ended, and the menu would read the new number as "no
@@ -209,26 +224,70 @@ enum ClaudeUsageCollector {
             }
             return .object(updated)
         }
+        // A session line that could not be read still means a 5-hour window
+        // may be open, so the stored one keeps its reset only while that is
+        // ahead. A passed reset would read as ended: in the menu as "no window
+        // open", and to later polls as "none open", the ground for concluding
+        // there is no 5-hour limit. Without a reset the window counts as open
+        // until 5 hours after this poll (`fiveHourSeenAt`, see `noWindowOpen`).
+        // Its percentage goes either way: this poll did not read one, and an
+        // earlier poll's number may not pass for the current one.
+        func possiblyOpen(_ old: JSONValue) -> JSONValue {
+            var updated = old.objectValue ?? JSONObject()
+            updated["used_percentage"] = .null
+            if let reset = finiteNumber(updated["resets_at"]), reset > now.timeIntervalSince1970 {
+                return .object(updated)
+            }
+            updated["resets_at"] = .null
+            return .object(updated)
+        }
         func oldWindow(_ key: String) -> JSONValue {
             // Python's `cur.get(key) or {}`
             guard let value = current[key], value.isPythonTruthy else { return .object(JSONObject()) }
             return value
         }
 
-        let capturedAt = Shell.nowSeconds()
+        let capturedAt = Int(now.timeIntervalSince1970)
         var snapshot = current
         snapshot["capturedAt"] = .int(capturedAt)
-        snapshot["fiveHour"] = window(oldWindow("fiveHour"), five, fiveReset)
+        snapshot["fiveHour"] = sessionLine && five == nil
+            ? possiblyOpen(oldWindow("fiveHour"))
+            : window(oldWindow("fiveHour"), five, fiveReset)
+        // A session line, readable or not, means a 5-hour window may be open
+        // now. Later polls judge "none open at the previous poll" by this
+        // time too, not by the stored reset alone.
+        if sessionLine {
+            snapshot["fiveHourSeenAt"] = .int(capturedAt)
+        }
         snapshot["sevenDay"] = window(oldWindow("sevenDay"), week, weekReset)
 
         // Per-model weekly buckets are keyed by the name `/usage` printed, so a
         // renamed or new model shows up without a code change. Buckets missing
         // a reset inherit the all-models weekly reset — the same window.
-        if !modelWindows.isEmpty {
-            var merged = JSONObject()
-            if let previous = current["modelWindows"], previous.isPythonTruthy, case .object(let object) = previous {
-                merged = object
+        var buckets = JSONObject()
+        if let previous = current["modelWindows"], previous.isPythonTruthy, case .object(let object) = previous {
+            buckets = object
+        }
+        // A bucket left out next to the all-models line is no reading any
+        // more: `/usage` stopped printing it (a retired or renamed model, or
+        // one it does not list right now). Its percentage and its reset go,
+        // so it no longer reads as current, draws the ring, or turns up as
+        // "reset" once that instant passes; a poll that prints it again brings
+        // it back. (No evidence reads an unprinted bucket's reset.) Output
+        // without the all-models line says nothing about the buckets, and
+        // they stay as they were.
+        if week != nil, !buckets.isEmpty {
+            let printed = Set(modelWindows.map { $0.name })
+            for (name, value) in buckets.entries where !printed.contains(name) {
+                guard case .object(var bucket) = value else { continue }
+                bucket["used_percentage"] = .null
+                bucket["resets_at"] = .null
+                buckets[name] = .object(bucket)
             }
+            snapshot["modelWindows"] = .object(buckets)
+        }
+        if !modelWindows.isEmpty {
+            var merged = buckets
             for bucket in modelWindows {
                 var resetValue = JSONValue.null
                 if let reset = bucket.reset ?? weekReset {
@@ -241,6 +300,25 @@ enum ClaudeUsageCollector {
             }
             snapshot["modelWindows"] = .object(merged)
         }
+
+        // On an account without a 5-hour limit the last window, long ended,
+        // would otherwise stay in the snapshot for good.
+        let absentSince = fiveHourAbsence(
+            before: current,
+            after: snapshot,
+            models: modelWindows.map { $0.name },
+            sessionLine: sessionLine,
+            at: capturedAt
+        )
+        if !sessionLine {
+            moveSightingBeforePoll(&snapshot, previous: current, capturedAt: capturedAt)
+        }
+        if absentSince != nil {
+            snapshot["fiveHour"] = .null
+        } else if !sessionLine {
+            settleWithoutSessionLine(&snapshot, previous: current, at: now)
+        }
+        snapshot["fiveHourAbsentSince"] = absentSince
         snapshot["source"] = .string("usage-poll")
 
         let json = JSONValue.object(snapshot).pythonText(ensureASCII: true, compact: false)
@@ -248,8 +326,175 @@ enum ClaudeUsageCollector {
         writeState(paths, "ok", "")
 
         let models = modelWindows.map { "'\($0.name)'" }.sorted().joined(separator: ", ")
-        io.out("snapshot updated: 5h=\(five.map { String($0) } ?? "None")% week=\(week.map { String($0) } ?? "None")% models=[\(models)] capturedAt=\(capturedAt)")
+        var summary = "snapshot updated: 5h=\(five.map { String($0) } ?? "None")% week=\(week.map { String($0) } ?? "None")% models=[\(models)] capturedAt=\(capturedAt)"
+        if let absentSince {
+            summary += " fiveHourAbsentSince=\(absentSince.pythonText(ensureASCII: true, compact: true))"
+        }
+        io.out(summary)
         return 0
+    }
+
+    // MARK: - Accounts without a 5-hour limit
+
+    /// `fiveHourAbsentSince` for this poll: since when the account is known
+    /// to have no 5-hour limit, or nil while it may have one.
+    ///
+    /// Verified Ultra accounts lost the limit from 2026-10-30 (Pro and Max
+    /// keep it), and `/usage` then prints no session line — the same output
+    /// as between two 5-hour windows, so a missing line proves nothing alone.
+    /// Two polls under 5 hours apart do, when weekly usage grew in between
+    /// and no 5-hour window was open at the first: with the limit, that usage
+    /// opened a window lasting 5 hours from its first message, still open at
+    /// the second poll, which would have printed the session line. (A window
+    /// already open at the first poll could have taken the usage and closed
+    /// since, which is why none may be open then, see `noWindowOpen`.) Both
+    /// bounds keep `evidenceSlack` clear: the last 5-hour window must have
+    /// ended 10 minutes before the first poll, and the polls be 10 minutes
+    /// under 5 hours apart. Once concluded it holds, with no new evidence
+    /// needed, until a poll prints a session line again.
+    private static func fiveHourAbsence(
+        before previous: JSONObject,
+        after updated: JSONObject,
+        models: [String],
+        sessionLine: Bool,
+        at now: Int
+    ) -> JSONValue? {
+        guard !sessionLine else { return nil }
+        if let since = previous["fiveHourAbsentSince"], finiteNumber(since) != nil {
+            return since
+        }
+
+        guard let then = finiteNumber(previous["capturedAt"]) else { return nil }
+        let elapsed = Double(now) - then
+        guard elapsed > 0, elapsed < fiveHours - evidenceSlack,
+              noWindowOpen(previous["fiveHour"], seenAt: finiteNumber(previous["fiveHourSeenAt"]), at: then)
+        else { return nil }
+        let oldBuckets = previous["modelWindows"]?.objectValue
+        let newBuckets = updated["modelWindows"]?.objectValue
+        let used = usageGrew(previous["sevenDay"], updated["sevenDay"])
+            || models.contains { usageGrew(oldBuckets?[$0], newBuckets?[$0]) }
+        return used ? .int(now) : nil
+    }
+
+    /// No 5-hour window was open at the previous poll, taken at `then`: the
+    /// last one known had ended `evidenceSlack` before it.
+    ///
+    /// Two things bound when that was: the last poll that printed a session
+    /// line (`seenAt`, a window may have been open then), and the stored
+    /// window's reset, or for one without a reset (a percentage alone, or
+    /// what an unreadable session line leaves) 5 hours after `seenAt`, since
+    /// no window lasts longer. The later of them counts. A previous poll that
+    /// printed the line itself proves nothing, whatever its reset says: the
+    /// Mac's clock may run fast, or the reset fall in the hour a clock change
+    /// repeats (stored at its first occurrence). No window stored and no line
+    /// ever seen: none was open (a fresh install).
+    private static func noWindowOpen(_ window: JSONValue?, seenAt: Double?, at then: Double) -> Bool {
+        if let seenAt, seenAt >= then { return false }
+        let end: Double?
+        switch storedFiveHour(window) {
+        case .none:
+            end = nil
+        case .resets(let reset):
+            end = reset
+        case .unbounded:
+            // Undated so far; `settleWithoutSessionLine` dates it during this poll.
+            guard let seenAt else { return false }
+            end = seenAt + fiveHours
+        }
+        guard let bound = [end, seenAt].compactMap({ $0 }).max() else { return true }
+        return bound <= then - evidenceSlack
+    }
+
+    /// A stored 5-hour window, as far as "was one open?" goes.
+    private enum StoredFiveHour {
+        /// None stored: missing, null or `{}`.
+        case none
+        /// One with a known reset.
+        case resets(Double)
+        /// One without a usable reset: a percentage alone, what an unreadable
+        /// session line leaves, or anything else that is not a window.
+        case unbounded
+    }
+
+    private static func storedFiveHour(_ window: JSONValue?) -> StoredFiveHour {
+        switch window {
+        case nil, .null?:
+            return .none
+        case .object(let object)?:
+            if object.isEmpty { return .none }
+            return finiteNumber(object["resets_at"]).map(StoredFiveHour.resets) ?? .unbounded
+        default:
+            return .unbounded
+        }
+    }
+
+    /// No sighting is as late as a poll that printed no session line. One
+    /// stored that late (taken while the Mac's clock ran fast, since put
+    /// right) becomes the second before this poll: still about the latest a
+    /// window may have been open, but no longer a block on the conclusion for
+    /// as long as the clock was off. So only a poll that printed the line has
+    /// `fiveHourSeenAt` equal to its own capturedAt, which is how the menu
+    /// tells an unreadable session line from a missing one. (Every poll
+    /// without the line, whether it concludes, holds an absence or neither.)
+    private static func moveSightingBeforePoll(
+        _ snapshot: inout JSONObject, previous: JSONObject, capturedAt: Int
+    ) {
+        if let seen = finiteNumber(previous["fiveHourSeenAt"]), seen > Double(capturedAt - 1) {
+            snapshot["fiveHourSeenAt"] = .int(capturedAt - 1)
+        }
+    }
+
+    /// A poll that printed no session line and concluded nothing keeps the
+    /// stored 5-hour window, with two exceptions.
+    ///
+    /// A percentage was not printed this time while its window may still be
+    /// open: its reset is still ahead (the limit may have gone mid-window, or
+    /// the line is just missing), or it never had one. It loses its number:
+    /// none may read as current that no poll printed as current. A reset
+    /// ahead stays and still marks the window as possibly open for
+    /// `noWindowOpen`; that it went missing proves nothing by itself, as an
+    /// early reset on an account with the limit looks the same. A window that
+    /// ended stays as it is, for the menu to say when. And a window without a
+    /// reset, from before `fiveHourSeenAt` existed, is dated by the previous
+    /// poll, no earlier than its real sighting and before this one, so that
+    /// it ends 5 hours on instead of blocking the conclusion for good.
+    private static func settleWithoutSessionLine(
+        _ snapshot: inout JSONObject, previous: JSONObject, at now: Date
+    ) {
+        let latestSighting = Int(now.timeIntervalSince1970) - 1
+        switch storedFiveHour(previous["fiveHour"]) {
+        case .resets(let reset) where reset > now.timeIntervalSince1970:
+            guard case .object(var window)? = snapshot["fiveHour"] else { return }
+            window["used_percentage"] = .null
+            snapshot["fiveHour"] = .object(window)
+        case .unbounded:
+            if case .object(var window)? = previous["fiveHour"] {
+                window["used_percentage"] = .null
+                snapshot["fiveHour"] = .object(window)
+            }
+            guard finiteNumber(previous["fiveHourSeenAt"]) == nil,
+                  let then = previous["capturedAt"], let at = finiteNumber(then) else { return }
+            snapshot["fiveHourSeenAt"] = at > Double(latestSighting) ? .int(latestSighting) : then
+        default:
+            break
+        }
+    }
+
+    /// The same weekly window (an equal reset, as stored) shows a higher
+    /// percentage than before: Claude was used in between.
+    private static func usageGrew(_ before: JSONValue?, _ after: JSONValue?) -> Bool {
+        guard let old = before?.objectValue, let new = after?.objectValue,
+              let oldUsed = finiteNumber(old["used_percentage"]),
+              let newUsed = finiteNumber(new["used_percentage"]),
+              let oldReset = finiteNumber(old["resets_at"]),
+              let newReset = finiteNumber(new["resets_at"]) else { return false }
+        return newUsed > oldUsed && newReset == oldReset
+    }
+
+    /// A JSON number as a finite Double; nil for anything else.
+    private static func finiteNumber(_ value: JSONValue?) -> Double? {
+        guard case .number(let number)? = value, number.doubleValue.isFinite else { return nil }
+        return number.doubleValue
     }
 
     /// claude-collector-state.json: why this poll ended the way it did. The
@@ -262,101 +507,5 @@ enum ClaudeUsageCollector {
             "detail": .string(detail)
         ]))
         Shell.replaceAtomically(Data(state.pythonText(ensureASCII: false, compact: false).utf8), at: paths.collectorState)
-    }
-}
-
-/// Reset instants as `/usage` prints them: "Jul 22 at 8:50pm", "Jul 29 at
-/// 2pm" — no year, and ':00' dropped on whole hours. Ports `reset_epoch`,
-/// including Python's `strptime` matching rules.
-enum UsageResetTime {
-    private struct Format {
-        let regex: NSRegularExpression
-        let hasMinutes: Bool
-    }
-
-    // Python builds these from "%b %d at %I:%M%p %Y" and friends: whitespace
-    // in the format matches one or more spaces, matching ignores case, and the
-    // first match must consume the whole string.
-    private static let month = "(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)"
-    private static let day = "(3[01]|[12]\\d|0[1-9]|[1-9]| [1-9])"
-    private static let hour = "(1[0-2]|0[1-9]|[1-9])"
-    private static let minute = "([0-5]\\d|\\d)"
-    private static let ampm = "(am|pm)"
-    private static let year = "(\\d\\d\\d\\d)"
-
-    private static let formats: [Format] = [
-        Format(regex: make("\(month)\\s+\(day)\\s+at\\s+\(hour):\(minute)\(ampm)\\s+\(year)"), hasMinutes: true),
-        Format(regex: make("\(month)\\s+\(day)\\s+at\\s+\(hour)\(ampm)\\s+\(year)"), hasMinutes: false),
-        Format(regex: make("\(month)\\s+\(day)\\s+at\\s+\(hour):\(minute)\\s+\(ampm)\\s+\(year)"), hasMinutes: true),
-        Format(regex: make("\(month)\\s+\(day)\\s+at\\s+\(hour)\\s+\(ampm)\\s+\(year)"), hasMinutes: false)
-    ]
-
-    private static func make(_ pattern: String) -> NSRegularExpression {
-        try! NSRegularExpression(pattern: "^" + pattern, options: [.caseInsensitive])
-    }
-
-    private static let months = ["jan", "feb", "mar", "apr", "may", "jun",
-                                 "jul", "aug", "sep", "oct", "nov", "dec"]
-
-    /// The reset instant as epoch seconds, rolled forward by whole windows
-    /// until it is not in the past; nil when the text is not a reset time.
-    static func epoch(text: String?, timeZoneName: String?, windowLength: Double, now: Date = Date()) -> Double? {
-        guard let raw = text, !raw.isEmpty else { return nil }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        var zone = TimeZone.current
-        if let name = timeZoneName, !name.isEmpty, let named = TimeZone(identifier: name) {
-            zone = named
-        }
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = zone
-        let currentYear = calendar.component(.year, from: now)
-
-        let input = "\(trimmed) \(currentYear)"
-        let nsInput = input as NSString
-        for format in formats {
-            guard let match = format.regex.firstMatch(in: input, range: NSRange(location: 0, length: nsInput.length)),
-                  match.range.location == 0,
-                  match.range.length == nsInput.length else { continue }
-            func part(_ index: Int) -> String {
-                nsInput.substring(with: match.range(at: index))
-            }
-            guard let monthIndex = months.firstIndex(of: part(1).lowercased()),
-                  let dayValue = Int(part(2).trimmingCharacters(in: .whitespaces)),
-                  let hour12 = Int(part(3)) else { continue }
-            var group = 4
-            var minuteValue = 0
-            if format.hasMinutes {
-                guard let parsed = Int(part(group)) else { continue }
-                minuteValue = parsed
-                group += 1
-            }
-            let isPM = part(group).lowercased() == "pm"
-            guard let yearValue = Int(part(group + 1)) else { continue }
-
-            var hour24 = hour12 == 12 ? 0 : hour12
-            if isPM { hour24 += 12 }
-
-            // datetime() rejects a day the month does not have (Feb 30).
-            var components = DateComponents()
-            components.year = yearValue
-            components.month = monthIndex + 1
-            guard let firstOfMonth = calendar.date(from: components),
-                  let daysInMonth = calendar.range(of: .day, in: .month, for: firstOfMonth)?.count,
-                  dayValue >= 1, dayValue <= daysInMonth else { continue }
-
-            components.day = dayValue
-            components.hour = hour24
-            components.minute = minuteValue
-            components.second = 0
-            guard let date = calendar.date(from: components) else { continue }
-
-            // The printed instant may already have passed; walk it forward.
-            var epoch = date.timeIntervalSince1970
-            let current = now.timeIntervalSince1970
-            while epoch < current { epoch += windowLength }
-            return epoch
-        }
-        return nil
     }
 }

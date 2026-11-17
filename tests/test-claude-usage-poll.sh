@@ -41,9 +41,43 @@ check() {
   fi
 }
 
+# poll_usage <name> [VAR=value...]: one `ClaudePace poll-usage` on the fake HOME
+# with those variables set, its stdout in $poll_output. The poll ends with 0 on
+# every path, failures included (claude-collector-state.json names them), so
+# any other status is a crash, and a crashed poll leaves the snapshot as it
+# was: every "kept" and "not concluded" check below would pass on that alone.
+poll_output=""
+poll_usage() {
+  local name="$1" status=0
+  shift
+  poll_output="$(env HOME="$fake_home" PATH="$scratch/bin:$PATH" "$@" "$bin" poll-usage 2>/dev/null)" || status=$?
+  if [ "$status" -ne 0 ]; then
+    failures=$((failures + 1))
+    printf 'FAIL: %s: poll-usage exited %s\n' "$name" "$status" >&2
+  fi
+}
+
+# run_poll <fixture>: a poll that reads that /usage output and takes it. One
+# that refuses its output (parse-failed, no-limits, ...) also ends with 0 and
+# leaves the snapshot as it was, which would pass the same checks on that
+# alone, so a poll that does not update the snapshot fails here too.
 run_poll() {
-  HOME="$fake_home" PATH="$scratch/bin:$PATH" FAKE_USAGE_FILE="${1:-}" \
-    "$bin" poll-usage >/dev/null 2>&1 || true
+  local name="poll of ${1##*/} (line ${BASH_LINENO[0]})"
+  poll_usage "$name" FAKE_USAGE_FILE="$1"
+  case "$poll_output" in
+    "snapshot updated: "*) ;;
+    *)
+      failures=$((failures + 1))
+      printf 'FAIL: %s: snapshot not updated (state %s)\n' "$name" \
+        "$(field "$appdir/claude-collector-state.json" status)" >&2
+      ;;
+  esac
+}
+
+# run_refused_poll <fixture>: a poll that must leave the snapshot alone (the
+# checks after it say so, and why).
+run_refused_poll() {
+  poll_usage "poll of ${1##*/} (line ${BASH_LINENO[0]})" FAKE_USAGE_FILE="$1"
 }
 
 field() { python3 -c "
@@ -57,13 +91,70 @@ for k in sys.argv[2].split('.'):
 print('<none>' if cur is None else cur)
 " "$1" "$2"; }
 
+# json <path>: the snapshot value at a dotted path as JSON (null stays null),
+# or <missing>.
+json() { python3 -c "
+import json,sys
+cur=json.load(open(sys.argv[1]))
+for k in sys.argv[2].split('.'):
+    if not (isinstance(cur,dict) and k in cur): print('<missing>'); sys.exit(0)
+    cur=cur[k]
+print(json.dumps(cur, sort_keys=True))
+" "$appdir/snapshot.json" "$1"; }
+
+canonical() { python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1]), sort_keys=True))' "$1"; }
+
+# check_instant <name> <epoch> <path>: the snapshot holds exactly that instant.
+check_instant() {
+  local actual
+  actual="$(field "$appdir/snapshot.json" "$3")"
+  python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) == float(sys.argv[2]) else 1)' "$2" "$actual" 2>/dev/null \
+    || check "$1" "$2" "$actual"
+}
+
+# edit_snapshot key=JSON...: set top-level keys of snapshot.json (an empty
+# value drops the key), turning what a poll left into the next poll's past.
+edit_snapshot() {
+  python3 - "$appdir/snapshot.json" "$@" <<'PY'
+import json, sys
+path = sys.argv[1]
+snapshot = json.load(open(path))
+for assignment in sys.argv[2:]:
+    key, _, value = assignment.partition("=")
+    if value:
+        snapshot[key] = json.loads(value)
+    else:
+        snapshot.pop(key, None)
+json.dump(snapshot, open(path, "w"))
+PY
+}
+
+# /usage prints a reset in the account's zone without a year, dropping ":00" on
+# whole hours. reset_at <seconds from now> <minutes|hour> prints one for
+# Asia/Seoul ("Nov 17 at 8:50pm" with the minutes set to :50, or "Nov 18 at
+# 2pm" on the hour), a tab, and the epoch it stands for.
+reset_at() {
+  python3 - "$1" "$2" <<'PY'
+import datetime, sys
+from zoneinfo import ZoneInfo
+offset, form = int(sys.argv[1]), sys.argv[2]
+t = datetime.datetime.now(ZoneInfo("Asia/Seoul")) + datetime.timedelta(seconds=offset)
+t = t.replace(minute=50 if form == "minutes" else 0, second=0, microsecond=0)
+month = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()[t.month - 1]
+clock = str(t.hour % 12 or 12) + (f":{t.minute:02d}" if form == "minutes" else "")
+print(f"{month} {t.day} at {clock}{'am' if t.hour < 12 else 'pm'}\t{int(t.timestamp())}")
+PY
+}
+
 # --- 1) full output: minute-bearing 5h reset, whole-hour weekly reset, model bucket
-cat > "$scratch/full.txt" <<'OUT'
+IFS=$'\t' read -r session_reset session_epoch < <(reset_at $((3 * 3600)) minutes)
+IFS=$'\t' read -r week_reset week_epoch < <(reset_at $((2 * 86400)) hour)
+cat > "$scratch/full.txt" <<OUT
 You are currently using your subscription to power your Claude Code usage
 
-Current session: 22% used · resets Jul 22 at 8:50pm (Asia/Seoul)
-Current week (all models): 5% used · resets Jul 29 at 2pm (Asia/Seoul)
-Current week (Opus): 8% used · resets Jul 29 at 2pm (Asia/Seoul)
+Current session: 22% used · resets $session_reset (Asia/Seoul)
+Current week (all models): 5% used · resets $week_reset (Asia/Seoul)
+Current week (Opus): 8% used · resets $week_reset (Asia/Seoul)
 
 What's contributing to your limits usage?
 OUT
@@ -72,6 +163,7 @@ check "full: 5h percent"      "22" "$(field "$appdir/snapshot.json" fiveHour.use
 check "full: week percent"    "5"  "$(field "$appdir/snapshot.json" sevenDay.used_percentage)"
 check "full: model bucket"    "8"  "$(field "$appdir/snapshot.json" modelWindows.Opus.used_percentage)"
 check "full: state"           "ok" "$(field "$appdir/claude-collector-state.json" status)"
+check "full: session line seen at this poll" "$(json capturedAt)" "$(json fiveHourSeenAt)"
 [ "$(field "$appdir/snapshot.json" fiveHour.resets_at)" != "<none>" ] \
   || { failures=$((failures+1)); echo "FAIL: full: 5h reset parsed (minutes)" >&2; }
 [ "$(field "$appdir/snapshot.json" sevenDay.resets_at)" != "<none>" ] \
@@ -79,19 +171,26 @@ check "full: state"           "ok" "$(field "$appdir/claude-collector-state.json
 [ "$(field "$appdir/snapshot.json" modelWindows.Opus.resets_at)" != "<none>" ] \
   || { failures=$((failures+1)); echo "FAIL: full: model bucket inherits weekly reset" >&2; }
 
-# Resets must be in the future — a printed instant that already passed is rolled
-# forward, never stored in the past where the app would show a dead window.
-now_epoch="$(date +%s)"
-for path in fiveHour.resets_at sevenDay.resets_at; do
-  v="$(field "$appdir/snapshot.json" "$path")"
-  python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) > float(sys.argv[2]) else 1)" "$v" "$now_epoch" \
-    || { failures=$((failures+1)); echo "FAIL: $path rolled into the future ($v <= $now_epoch)" >&2; }
-done
+# Resets are stored exactly as printed: one still ahead as that instant...
+check_instant "full: 5h reset as printed"     "$session_epoch" fiveHour.resets_at
+check_instant "full: weekly reset as printed" "$week_epoch"    sevenDay.resets_at
+check_instant "full: model reset as printed"  "$week_epoch"    modelWindows.Opus.resets_at
+
+# ...and one that already passed as well, in the past where the app reads an
+# ended window. Rolled forward by whole windows it paired the ended window's
+# percentage with an invented reset.
+IFS=$'\t' read -r passed_reset passed_epoch < <(reset_at $((-2 * 3600)) minutes)
+printf 'Current session: 64%% used · resets %s (Asia/Seoul)\n' "$passed_reset" > "$scratch/passed.txt"
+run_poll "$scratch/passed.txt"
+check "passed reset: 5h percent" "64" "$(field "$appdir/snapshot.json" fiveHour.used_percentage)"
+check_instant "passed reset: stored as printed, not rolled" "$passed_epoch" fiveHour.resets_at
+[ "$passed_epoch" -lt "$(date +%s)" ] \
+  || { failures=$((failures+1)); echo "FAIL: passed reset: fixture $passed_epoch is not in the past" >&2; }
 
 # --- 2) expired CLI login: snapshot frozen, cause named
 before="$(cat "$appdir/snapshot.json")"
 printf 'Failed to authenticate: OAuth session expired and could not be refreshed\n' > "$scratch/auth.txt"
-run_poll "$scratch/auth.txt"
+run_refused_poll "$scratch/auth.txt"
 check "signed-out: snapshot untouched" "$before" "$(cat "$appdir/snapshot.json")"
 check "signed-out: state" "signed-out" "$(field "$appdir/claude-collector-state.json" status)"
 
@@ -102,36 +201,35 @@ You are currently using your subscription to power your Claude Code usage
 What's contributing to your limits usage?
 Last 24h · 104 requests · 3 sessions
 OUT
-run_poll "$scratch/nolimits.txt"
+run_refused_poll "$scratch/nolimits.txt"
 check "no-limits: snapshot untouched" "$before" "$(cat "$appdir/snapshot.json")"
 check "no-limits: state" "no-limits" "$(field "$appdir/claude-collector-state.json" status)"
 
 # --- 4) empty output
 : > "$scratch/empty.txt"
-run_poll "$scratch/empty.txt"
+run_refused_poll "$scratch/empty.txt"
 check "empty: snapshot untouched" "$before" "$(cat "$appdir/snapshot.json")"
 check "empty: state" "empty-output" "$(field "$appdir/claude-collector-state.json" status)"
 
 # --- 5) weekly-only output still yields a usable window
-cat > "$scratch/weekonly.txt" <<'OUT'
-Current week (all models): 41% used · resets Aug 27 at 2pm (Asia/Seoul)
+IFS=$'\t' read -r later_week_reset _ < <(reset_at $((5 * 86400)) hour)
+cat > "$scratch/weekonly.txt" <<OUT
+Current week (all models): 41% used · resets $later_week_reset (Asia/Seoul)
 OUT
 run_poll "$scratch/weekonly.txt"
 check "week-only: week percent" "41" "$(field "$appdir/snapshot.json" sevenDay.used_percentage)"
 check "week-only: state" "ok" "$(field "$appdir/claude-collector-state.json" status)"
 
 # --- 6) claude missing entirely
-HOME="$fake_home" CLAUDE_BIN="$scratch/no-such-claude" \
-  "$bin" poll-usage >/dev/null 2>&1 || true
+poll_usage "cli-missing" CLAUDE_BIN="$scratch/no-such-claude"
 check "cli-missing: state" "cli-missing" "$(field "$appdir/claude-collector-state.json" status)"
 
 # --- 7) CLI reports signed out: named exactly, and /usage is never called
 call_log="$scratch/calls.txt"
 : > "$call_log"
-HOME="$fake_home" PATH="$scratch/bin:$PATH" FAKE_CALL_LOG="$call_log" \
+poll_usage "signed-out precheck" FAKE_CALL_LOG="$call_log" \
   FAKE_AUTH='{"loggedIn": false, "authMethod": "none"}' \
-  FAKE_USAGE_FILE="$scratch/full.txt" \
-  "$bin" poll-usage >/dev/null 2>&1 || true
+  FAKE_USAGE_FILE="$scratch/full.txt"
 check "signed-out precheck: state" "signed-out" "$(field "$appdir/claude-collector-state.json" status)"
 if grep -q -- '-p /usage' "$call_log"; then
   failures=$((failures + 1))
@@ -140,9 +238,7 @@ fi
 
 # --- 8) a signed-in CLI still reaches /usage
 : > "$call_log"
-HOME="$fake_home" PATH="$scratch/bin:$PATH" FAKE_CALL_LOG="$call_log" \
-  FAKE_USAGE_FILE="$scratch/full.txt" \
-  "$bin" poll-usage >/dev/null 2>&1 || true
+poll_usage "signed-in" FAKE_CALL_LOG="$call_log" FAKE_USAGE_FILE="$scratch/full.txt"
 check "signed-in: state" "ok" "$(field "$appdir/claude-collector-state.json" status)"
 grep -q -- '-p /usage' "$call_log" || {
   failures=$((failures + 1))
@@ -160,9 +256,7 @@ grep -q -- '--no-session-persistence' "$call_log" || {
 # snapshot is kept and the cause named, instead of every later poll stalling
 before="$(cat "$appdir/snapshot.json")"
 started=$SECONDS
-HOME="$fake_home" PATH="$scratch/bin:$PATH" CLAUDE_USAGE_TIMEOUT=2 FAKE_USAGE_SLEEP=60 \
-  FAKE_USAGE_FILE="$scratch/full.txt" \
-  "$bin" poll-usage >/dev/null 2>&1 || true
+poll_usage "usage timeout" CLAUDE_USAGE_TIMEOUT=2 FAKE_USAGE_SLEEP=60 FAKE_USAGE_FILE="$scratch/full.txt"
 elapsed=$((SECONDS - started))
 check "usage timeout: snapshot untouched" "$before" "$(cat "$appdir/snapshot.json")"
 check "usage timeout: state" "timed-out" "$(field "$appdir/claude-collector-state.json" status)"
@@ -171,9 +265,8 @@ check "usage timeout: state" "timed-out" "$(field "$appdir/claude-collector-stat
 # --- 10) the same for `auth status`, and /usage is then not attempted
 : > "$call_log"
 started=$SECONDS
-HOME="$fake_home" PATH="$scratch/bin:$PATH" CLAUDE_USAGE_TIMEOUT=2 FAKE_AUTH_SLEEP=60 \
-  FAKE_CALL_LOG="$call_log" FAKE_USAGE_FILE="$scratch/full.txt" \
-  "$bin" poll-usage >/dev/null 2>&1 || true
+poll_usage "auth timeout" CLAUDE_USAGE_TIMEOUT=2 FAKE_AUTH_SLEEP=60 \
+  FAKE_CALL_LOG="$call_log" FAKE_USAGE_FILE="$scratch/full.txt"
 elapsed=$((SECONDS - started))
 check "auth timeout: snapshot untouched" "$before" "$(cat "$appdir/snapshot.json")"
 check "auth timeout: state" "timed-out" "$(field "$appdir/claude-collector-state.json" status)"
@@ -184,9 +277,7 @@ if grep -q -- '-p /usage' "$call_log"; then
 fi
 
 # --- 11) a normal poll afterwards recovers
-HOME="$fake_home" PATH="$scratch/bin:$PATH" CLAUDE_USAGE_TIMEOUT=2 \
-  FAKE_USAGE_FILE="$scratch/full.txt" \
-  "$bin" poll-usage >/dev/null 2>&1 || true
+poll_usage "after timeout" CLAUDE_USAGE_TIMEOUT=2 FAKE_USAGE_FILE="$scratch/full.txt"
 check "after timeout: state" "ok" "$(field "$appdir/claude-collector-state.json" status)"
 
 # --- 12) a statusLine render without rate_limits (Claude Code 2.1.x) leaves
@@ -224,6 +315,415 @@ run_poll "$scratch/noreset.txt"
 check "no reset, past prior: 5h percent" "3" "$(field "$appdir/snapshot.json" fiveHour.used_percentage)"
 check "no reset, past prior: stale reset dropped" "<none>" "$(field "$appdir/snapshot.json" fiveHour.resets_at)"
 check "no reset, past prior: state" "ok" "$(field "$appdir/claude-collector-state.json" status)"
+
+# --- 16) an account with no 5-hour limit (verified Ultra accounts lost it from
+# 2026-10-30) gets no session line, exactly as between two 5-hour windows.
+# Weekly usage that grew between two polls under 5 hours apart, with no 5-hour
+# window open at the first, settles it: with the limit, that usage would have
+# opened a window still open at the second poll, which then prints the line.
+IFS=$'\t' read -r weekly_reset _ < <(reset_at $((26 * 3600)) hour)
+weekly_output() {  # weekly_output <file> <all models %> <Fable %>: the 2026-11-17 shape
+  printf '%s\n' 'You are currently using your subscription to power your Claude Code usage' '' \
+    "Current week (all models): $2% used · resets $weekly_reset (Asia/Seoul)" \
+    "Current week (Fable): $3% used · resets $weekly_reset (Asia/Seoul)" > "$1"
+}
+weekly_output "$scratch/week60.txt" 60 91
+weekly_output "$scratch/week61.txt" 61 91
+weekly_output "$scratch/fable92.txt" 60 92
+
+# previous_poll <seconds ago> <fiveHour JSON> [epoch]: what the poll before the
+# next one left: weekly only, 60% and Fable 91%, that long ago, with this 5h
+# window, and a session line last seen at that epoch (fiveHourSeenAt). Without
+# one, none was ever seen, as in a snapshot from before fiveHourSeenAt.
+previous_poll() {
+  run_poll "$scratch/week60.txt"
+  edit_snapshot "capturedAt=$(($(date +%s) - $1))" "fiveHour=$2" "fiveHourSeenAt=${3:-}" "fiveHourAbsentSince="
+}
+# The last window, ended days ago, like the one the 2026-11-17 snapshot kept.
+ended="{\"used_percentage\": 9, \"resets_at\": $(($(date +%s) - 3 * 86400)).0}"
+
+previous_poll 180 "$ended"
+run_poll "$scratch/week61.txt"
+check "no 5h limit: 5h window" "null" "$(json fiveHour)"
+check "no 5h limit: since this poll" "$(json capturedAt)" "$(json fiveHourAbsentSince)"
+check "no 5h limit: week percent" "61" "$(json sevenDay.used_percentage)"
+check "no 5h limit: state" "ok" "$(field "$appdir/claude-collector-state.json" status)"
+absent_since="$(json fiveHourAbsentSince)"
+
+# --- 17) ...and it holds on later weekly-only polls with no new evidence (no
+# growth, 6 hours on)
+edit_snapshot "capturedAt=$(($(date +%s) - 6 * 3600))"
+run_poll "$scratch/week61.txt"
+check "no 5h limit kept: 5h window" "null" "$(json fiveHour)"
+check "no 5h limit kept: since unchanged" "$absent_since" "$(json fiveHourAbsentSince)"
+
+# --- 18) ...until a session line is back: read as usual, the absence dropped
+run_poll "$scratch/full.txt"
+check "session line back: 5h percent" "22" "$(json fiveHour.used_percentage)"
+check_instant "session line back: 5h reset" "$session_epoch" fiveHour.resets_at
+check "session line back: absence dropped" "<missing>" "$(json fiveHourAbsentSince)"
+
+# --- 19) no growth: maybe just between two 5-hour windows, so the ended window
+# stays for the app to say so
+previous_poll 180 "$ended"
+run_poll "$scratch/week60.txt"
+check "no growth: ended window kept" "$(canonical "$ended")" "$(json fiveHour)"
+check "no growth: not concluded" "<missing>" "$(json fiveHourAbsentSince)"
+
+# --- 20) growth over more than 5 hours: a window could have opened and ended
+# in between
+previous_poll $((6 * 3600)) "$ended"
+run_poll "$scratch/week61.txt"
+check "growth over 6h: ended window kept" "$(canonical "$ended")" "$(json fiveHour)"
+check "growth over 6h: not concluded" "<missing>" "$(json fiveHourAbsentSince)"
+
+# --- 21) growth, but a 5-hour window was still open at the previous poll: the
+# usage may have gone into it before it ended a minute ago
+closed="{\"used_percentage\": 40, \"resets_at\": $(($(date +%s) - 60)).0}"
+previous_poll 180 "$closed"
+run_poll "$scratch/week61.txt"
+check "window open before: kept" "$(canonical "$closed")" "$(json fiveHour)"
+check "window open before: not concluded" "<missing>" "$(json fiveHourAbsentSince)"
+
+# --- 22) the same for a 5-hour percentage whose reset could not be read; its
+# number goes, as no poll printed it as current
+previous_poll 180 '{"used_percentage": 40, "resets_at": null}'
+run_poll "$scratch/week61.txt"
+check "unknown reset before: percentage blanked" '{"resets_at": null, "used_percentage": null}' "$(json fiveHour)"
+check "unknown reset before: not concluded" "<missing>" "$(json fiveHourAbsentSince)"
+
+# --- 23) growth against another weekly reset compares two different windows
+IFS=$'\t' read -r next_week_reset _ < <(reset_at $((8 * 86400)) hour)
+printf '%s\n' "Current week (all models): 70% used · resets $next_week_reset (Asia/Seoul)" > "$scratch/next-week.txt"
+previous_poll 180 "$ended"
+run_poll "$scratch/next-week.txt"
+check "another weekly window: ended window kept" "$(canonical "$ended")" "$(json fiveHour)"
+check "another weekly window: not concluded" "<missing>" "$(json fiveHourAbsentSince)"
+
+# --- 24) growth in a per-model weekly bucket counts too, and the poll says so
+previous_poll 180 "$ended"
+run_poll "$scratch/fable92.txt"
+check "model growth: 5h window" "null" "$(json fiveHour)"
+check "model growth: since this poll" "$(json capturedAt)" "$(json fiveHourAbsentSince)"
+check "model growth: output" \
+  "snapshot updated: 5h=None% week=60% models=['Fable'] capturedAt=$(json capturedAt) fiveHourAbsentSince=$(json capturedAt)" \
+  "$poll_output"
+
+# --- 25) a session line that cannot be read still means a 5-hour limit, and a
+# window that may be open: no reset, so nothing reads it as ended, and no
+# percentage, since this poll read none
+printf '%s\n' 'Current session: ?% used' \
+  "Current week (all models): 62% used · resets $weekly_reset (Asia/Seoul)" > "$scratch/session-unread.txt"
+previous_poll 180 null
+edit_snapshot "fiveHourAbsentSince=$(($(date +%s) - 3600))"
+run_poll "$scratch/session-unread.txt"
+check "unreadable session line: absence dropped" "<missing>" "$(json fiveHourAbsentSince)"
+check "unreadable session line: no 5h reading" '{"resets_at": null, "used_percentage": null}' "$(json fiveHour)"
+check "unreadable session line: seen at this poll" "$(json capturedAt)" "$(json fiveHourSeenAt)"
+check "unreadable session line: week percent" "62" "$(json sevenDay.used_percentage)"
+check "unreadable session line: state" "ok" "$(field "$appdir/claude-collector-state.json" status)"
+
+# --- 26) the ended window kept from before loses its passed reset there too,
+# so growth by a later poll, which prints no session line, proves nothing: the
+# window that line stood for may have taken the usage and ended in between. A
+# reset still ahead is the open window's, and stays; the percentage goes either
+# way, as no poll read it as current. (The unreadable line is dated 3 minutes
+# before the previous poll, which printed none.)
+printf '%s\n' "Current session (5h): 30% used · resets $session_reset (Asia/Seoul)" \
+  "Current week (all models): 60% used · resets $weekly_reset (Asia/Seoul)" > "$scratch/session-reshaped.txt"
+previous_poll 180 "$ended"
+run_poll "$scratch/session-reshaped.txt"
+check "unreadable session line, ended window: reset and percentage dropped" \
+  '{"resets_at": null, "used_percentage": null}' "$(json fiveHour)"
+edit_snapshot "capturedAt=$(($(date +%s) - 180))" "fiveHourSeenAt=$(($(date +%s) - 360))"
+run_poll "$scratch/week61.txt"
+check "growth after an unreadable session line: kept" \
+  '{"resets_at": null, "used_percentage": null}' "$(json fiveHour)"
+check "growth after an unreadable session line: not concluded" "<missing>" "$(json fiveHourAbsentSince)"
+open_reset_at=$(($(date +%s) + 7200))
+previous_poll 180 "{\"used_percentage\": 30, \"resets_at\": $open_reset_at.0}"
+run_poll "$scratch/session-reshaped.txt"
+check "unreadable session line, open window: percentage dropped" "null" "$(json fiveHour.used_percentage)"
+check_instant "unreadable session line, open window: reset kept" "$open_reset_at" fiveHour.resets_at
+
+# --- 27) the evidence keeps 10 minutes clear of both bounds. capturedAt is
+# stamped once the CLI has returned, a little after /usage looked, and /usage
+# prints resets to the minute: a printed reset 5 seconds before the previous
+# poll's capturedAt may belong to a window still open when that poll looked
+t0=$(($(date +%s) - 180))
+just_closed="{\"used_percentage\": 97, \"resets_at\": $((t0 - 5)).0}"
+previous_poll 180 "$just_closed"
+edit_snapshot "capturedAt=$t0"
+run_poll "$scratch/week61.txt"
+check "reset just before the previous poll: kept" "$(canonical "$just_closed")" "$(json fiveHour)"
+check "reset just before the previous poll: not concluded" "<missing>" "$(json fiveHourAbsentSince)"
+
+# --- 28) ...and polls stamped 4h55m apart may have looked over 5 hours apart
+previous_poll $((4 * 3600 + 55 * 60)) "$ended"
+run_poll "$scratch/week61.txt"
+check "polls 4h55m apart: ended window kept" "$(canonical "$ended")" "$(json fiveHour)"
+check "polls 4h55m apart: not concluded" "<missing>" "$(json fiveHourAbsentSince)"
+
+# --- 29) a window that ended 15 minutes before a previous poll 4h45m back is
+# clear of both, and settles it
+t0=$(($(date +%s) - 4 * 3600 - 45 * 60))
+previous_poll $((4 * 3600 + 45 * 60)) "{\"used_percentage\": 40, \"resets_at\": $((t0 - 15 * 60)).0}"
+edit_snapshot "capturedAt=$t0"
+run_poll "$scratch/week61.txt"
+check "clear of both bounds: 5h window" "null" "$(json fiveHour)"
+check "clear of both bounds: since this poll" "$(json capturedAt)" "$(json fiveHourAbsentSince)"
+
+# --- 30) a previous poll stamped after this one (the clock was set back, or the
+# file edited) proves nothing
+previous_poll -600 "$ended"
+run_poll "$scratch/week61.txt"
+check "previous poll in the future: ended window kept" "$(canonical "$ended")" "$(json fiveHour)"
+check "previous poll in the future: not concluded" "<missing>" "$(json fiveHourAbsentSince)"
+
+# --- 31) a fresh install: the first poll stores no 5-hour window ({}) and has
+# seen no session line, so none was open at it, and growth by the next poll
+# settles it. The same from a stored null (a statusLine render without one).
+rm -f "$appdir/snapshot.json"
+run_poll "$scratch/week60.txt"
+check "fresh install: no 5h window stored" "{}" "$(json fiveHour)"
+check "fresh install: no session line seen" "<missing>" "$(json fiveHourSeenAt)"
+edit_snapshot "capturedAt=$(($(date +%s) - 180))"
+run_poll "$scratch/week61.txt"
+check "fresh install, {} before: 5h window" "null" "$(json fiveHour)"
+check "fresh install, {} before: since this poll" "$(json capturedAt)" "$(json fiveHourAbsentSince)"
+previous_poll 180 null
+run_poll "$scratch/week61.txt"
+check "fresh install, null before: 5h window" "null" "$(json fiveHour)"
+check "fresh install, null before: since this poll" "$(json capturedAt)" "$(json fiveHourAbsentSince)"
+
+# --- 32) the limit removed mid-window: the next poll prints no session line,
+# and the 95% the last one printed may not read as current (nor draw the ring)
+# for the rest of the window. Its reset stays: the window may still be open,
+# so growth proves nothing until that reset has passed by 10 minutes.
+IFS=$'\t' read -r open_reset open_epoch < <(reset_at $((3 * 3600)) minutes)
+printf '%s\n' "Current session: 95% used · resets $open_reset (Asia/Seoul)" \
+  "Current week (all models): 60% used · resets $weekly_reset (Asia/Seoul)" \
+  "Current week (Fable): 91% used · resets $weekly_reset (Asia/Seoul)" > "$scratch/session95.txt"
+run_poll "$scratch/session95.txt"
+seen="$(json capturedAt)"
+check "before the removal: 5h percent" "95" "$(json fiveHour.used_percentage)"
+check "before the removal: session line seen" "$seen" "$(json fiveHourSeenAt)"
+# A second on, as between real polls: a poll without the line never keeps a
+# sighting as late as itself (see 37).
+sleep 1
+run_poll "$scratch/week60.txt"
+check "removed mid-window: percentage blanked" "null" "$(json fiveHour.used_percentage)"
+check_instant "removed mid-window: reset kept" "$open_epoch" fiveHour.resets_at
+check "removed mid-window: sighting kept" "$seen" "$(json fiveHourSeenAt)"
+check "removed mid-window: not concluded" "<missing>" "$(json fiveHourAbsentSince)"
+edit_snapshot "capturedAt=$(($(date +%s) - 180))" "fiveHourSeenAt=$(($(date +%s) - 360))"
+run_poll "$scratch/week61.txt"
+check "growth before that reset: still blank" "null" "$(json fiveHour.used_percentage)"
+check "growth before that reset: not concluded" "<missing>" "$(json fiveHourAbsentSince)"
+# ...later: the reset passed 9 minutes before the previous poll, then 11
+t0=$(($(date +%s) - 180))
+blanked="{\"used_percentage\": null, \"resets_at\": $((t0 - 9 * 60)).0}"
+previous_poll 180 "$blanked" $((t0 - 3 * 3600))
+edit_snapshot "capturedAt=$t0"
+run_poll "$scratch/week61.txt"
+check "reset 9 minutes before the previous poll: kept" "$(canonical "$blanked")" "$(json fiveHour)"
+check "reset 9 minutes before the previous poll: not concluded" "<missing>" "$(json fiveHourAbsentSince)"
+t0=$(($(date +%s) - 180))
+previous_poll 180 "{\"used_percentage\": null, \"resets_at\": $((t0 - 11 * 60)).0}" $((t0 - 3 * 3600))
+edit_snapshot "capturedAt=$t0"
+run_poll "$scratch/week61.txt"
+check "reset 11 minutes before the previous poll: 5h window" "null" "$(json fiveHour)"
+check "reset 11 minutes before the previous poll: since this poll" "$(json capturedAt)" "$(json fiveHourAbsentSince)"
+
+# --- 33) a previous poll that printed the session line may have had a window
+# open, whatever its stored reset says: the Mac's clock may run fast, or the
+# reset fall in the hour a clock change repeats (stored at its first
+# occurrence). So may one that printed it 3 minutes before; one 11 minutes
+# before is clear.
+t0=$(($(date +%s) - 180))
+skewed="{\"used_percentage\": 40, \"resets_at\": $((t0 - 15 * 60)).0}"
+previous_poll 180 "$skewed" "$t0"
+edit_snapshot "capturedAt=$t0"
+run_poll "$scratch/week61.txt"
+check "session line at the previous poll: kept" "$(canonical "$skewed")" "$(json fiveHour)"
+check "session line at the previous poll: not concluded" "<missing>" "$(json fiveHourAbsentSince)"
+t0=$(($(date +%s) - 180))
+skewed="{\"used_percentage\": 40, \"resets_at\": $((t0 - 15 * 60)).0}"
+previous_poll 180 "$skewed" $((t0 - 3 * 60))
+edit_snapshot "capturedAt=$t0"
+run_poll "$scratch/week61.txt"
+check "session line 3 minutes before the previous poll: not concluded" "<missing>" "$(json fiveHourAbsentSince)"
+t0=$(($(date +%s) - 180))
+previous_poll 180 "{\"used_percentage\": 40, \"resets_at\": $((t0 - 15 * 60)).0}" $((t0 - 11 * 60))
+edit_snapshot "capturedAt=$t0"
+run_poll "$scratch/week61.txt"
+check "session line 11 minutes before the previous poll: since this poll" "$(json capturedAt)" "$(json fiveHourAbsentSince)"
+
+# --- 34) a window whose reset could not be read (what an unreadable session
+# line leaves) lasts at most 5 hours from when that line was seen: growth once
+# that has passed by 10 minutes is evidence again, instead of never
+unread='{"resets_at": null, "used_percentage": null}'
+t0=$(($(date +%s) - 180))
+previous_poll 180 "$unread" $((t0 - 5 * 3600 - 9 * 60))
+edit_snapshot "capturedAt=$t0"
+run_poll "$scratch/week61.txt"
+check "unreadable line 5h09m before the previous poll: kept" "$(canonical "$unread")" "$(json fiveHour)"
+check "unreadable line 5h09m before the previous poll: not concluded" "<missing>" "$(json fiveHourAbsentSince)"
+t0=$(($(date +%s) - 180))
+previous_poll 180 "$unread" $((t0 - 5 * 3600 - 11 * 60))
+edit_snapshot "capturedAt=$t0"
+run_poll "$scratch/week61.txt"
+check "unreadable line 5h11m before the previous poll: 5h window" "null" "$(json fiveHour)"
+check "unreadable line 5h11m before the previous poll: since this poll" "$(json capturedAt)" "$(json fiveHourAbsentSince)"
+
+# --- 35) a 5-hour percentage without a reset from before fiveHourSeenAt: the
+# first poll without a session line dates its sighting by the previous poll
+# (no earlier than the real one), so it, too, ends 5 hours on; its number goes
+legacy_window='{"used_percentage": 3}'
+previous_poll 180 "$legacy_window"
+t0="$(json capturedAt)"
+run_poll "$scratch/week61.txt"
+check "legacy 5h reading: percentage blanked" '{"used_percentage": null}' "$(json fiveHour)"
+check "legacy 5h reading: not concluded" "<missing>" "$(json fiveHourAbsentSince)"
+check "legacy 5h reading: dated by the previous poll" "$t0" "$(json fiveHourSeenAt)"
+t0=$(($(date +%s) - 180))
+dated=$((t0 - 5 * 3600 - 9 * 60))
+previous_poll 180 "$legacy_window"
+edit_snapshot "capturedAt=$dated"
+run_poll "$scratch/week60.txt"
+check "legacy 5h reading, polled 5h09m before: dated by that poll" "$dated" "$(json fiveHourSeenAt)"
+edit_snapshot "capturedAt=$t0"
+run_poll "$scratch/week61.txt"
+check "legacy 5h reading, dated 5h09m before the previous poll: not concluded" "<missing>" "$(json fiveHourAbsentSince)"
+check "legacy 5h reading, dated 5h09m before the previous poll: date kept" "$dated" "$(json fiveHourSeenAt)"
+t0=$(($(date +%s) - 180))
+dated=$((t0 - 5 * 3600 - 11 * 60))
+previous_poll 180 "$legacy_window"
+edit_snapshot "capturedAt=$dated"
+run_poll "$scratch/week60.txt"
+check "legacy 5h reading, polled 5h11m before: dated by that poll" "$dated" "$(json fiveHourSeenAt)"
+edit_snapshot "capturedAt=$t0"
+run_poll "$scratch/week61.txt"
+check "legacy 5h reading, dated 5h11m before the previous poll: 5h window" "null" "$(json fiveHour)"
+check "legacy 5h reading, dated 5h11m before the previous poll: since this poll" "$(json capturedAt)" "$(json fiveHourAbsentSince)"
+
+# --- 36) a model bucket /usage left out next to the all-models line is no
+# reading any more: its percentage and its reset go, so it no longer reads as
+# current, draws the ring or turns up as reset later, until a poll prints it
+# again. Output without the all-models line says nothing about the buckets.
+run_poll "$scratch/full.txt"
+check "bucket printed: percent" "8" "$(json modelWindows.Opus.used_percentage)"
+run_poll "$scratch/week60.txt"
+check "bucket not printed: percentage blanked" "null" "$(json modelWindows.Opus.used_percentage)"
+check "bucket not printed: reset dropped" "null" "$(json modelWindows.Opus.resets_at)"
+check "bucket printed alongside: percent" "91" "$(json modelWindows.Fable.used_percentage)"
+run_poll "$scratch/weekonly.txt"
+check "no bucket printed at all: each blanked" "null null" \
+  "$(json modelWindows.Opus.used_percentage) $(json modelWindows.Fable.used_percentage)"
+run_poll "$scratch/full.txt"
+check "bucket printed again: back" "8" "$(json modelWindows.Opus.used_percentage)"
+check_instant "bucket printed again: reset" "$week_epoch" modelWindows.Opus.resets_at
+check "bucket printed again: the other still blank" "null" "$(json modelWindows.Fable.used_percentage)"
+run_poll "$scratch/noreset.txt"
+check "no all-models line: buckets as they were" "8 null" \
+  "$(json modelWindows.Opus.used_percentage) $(json modelWindows.Fable.used_percentage)"
+
+# --- 37) no sighting is as late as a poll that printed no session line: one
+# stored ahead of it (taken while the Mac's clock ran fast, since put right)
+# becomes the second before this poll instead of blocking the conclusion for
+# as long as the clock was off. The same for a reset-less window dated by a
+# previous poll stamped ahead. Only a poll that printed the line has it at its
+# own capturedAt, which is how the menu tells an unreadable line from none.
+previous_poll 180 "$ended" $(($(date +%s) + 30 * 86400))
+run_poll "$scratch/week61.txt"
+check "sighting stored ahead: not concluded" "<missing>" "$(json fiveHourAbsentSince)"
+check "sighting stored ahead: now the second before this poll" "$(($(json capturedAt) - 1))" "$(json fiveHourSeenAt)"
+# 20 minutes on, as far as that sighting goes, growth settles it as usual
+weekly_output "$scratch/week62.txt" 62 91
+edit_snapshot "capturedAt=$(($(date +%s) - 300))" "fiveHourSeenAt=$(($(json fiveHourSeenAt) - 20 * 60))"
+run_poll "$scratch/week62.txt"
+check "sighting stored ahead, 20 minutes on: since this poll" "$(json capturedAt)" "$(json fiveHourAbsentSince)"
+previous_poll 180 "$legacy_window"
+edit_snapshot "capturedAt=$(($(date +%s) + 30 * 86400))"
+run_poll "$scratch/week61.txt"
+check "legacy 5h reading, previous poll ahead: dated the second before this poll" \
+  "$(($(json capturedAt) - 1))" "$(json fiveHourSeenAt)"
+menu="$(HOME="$fake_home" AI_USAGE_PRIMARY_PROVIDER=claude "$bin" menu-preview </dev/null)"
+check "legacy 5h reading, previous poll ahead: no unreadable line claimed" "0" "$(grep -c '해석하지 못함' <<<"$menu")"
+# ...also on a poll that only holds an absence already concluded
+previous_poll 180 null $(($(date +%s) + 86400))
+held_since=$(($(date +%s) - 3600))
+edit_snapshot "fiveHourAbsentSince=$held_since"
+run_poll "$scratch/week61.txt"
+check "absence held, sighting stored ahead: still held" "$held_since" "$(json fiveHourAbsentSince)"
+check "absence held, sighting stored ahead: the second before this poll" "$(($(json capturedAt) - 1))" "$(json fiveHourSeenAt)"
+# An open window whose sighting was stored ahead: blanked, and the menu gives
+# the missing line as the reason, with the window's end
+open_at=$(($(date +%s) + 7200))
+previous_poll 180 "{\"used_percentage\": 30, \"resets_at\": $open_at.0}" $(($(date +%s) + 3600))
+run_poll "$scratch/week61.txt"
+check "open window, sighting stored ahead: blanked" "null" "$(json fiveHour.used_percentage)"
+menu="$(HOME="$fake_home" AI_USAGE_PRIMARY_PROVIDER=claude "$bin" menu-preview </dev/null)"
+check "open window, sighting stored ahead: the menu names the missing line" "1 0" \
+  "$(grep -c '^사용률 값 없음 — 마지막 조회에 5시간 줄이 없음 (창은 ' <<<"$menu") $(grep -c '해석하지 못함' <<<"$menu")"
+
+# --- 38) "10 minutes clear" includes exactly 10 minutes, for the reset and for
+# the sighting
+t0=$(($(date +%s) - 180))
+previous_poll 180 "{\"used_percentage\": 40, \"resets_at\": $((t0 - 600)).0}" $((t0 - 3 * 3600))
+edit_snapshot "capturedAt=$t0"
+run_poll "$scratch/week61.txt"
+check "reset exactly 10 minutes before the previous poll: since this poll" "$(json capturedAt)" "$(json fiveHourAbsentSince)"
+t0=$(($(date +%s) - 180))
+previous_poll 180 "{\"used_percentage\": 40, \"resets_at\": $((t0 - 3600)).0}" $((t0 - 600))
+edit_snapshot "capturedAt=$t0"
+run_poll "$scratch/week61.txt"
+check "session line exactly 10 minutes before the previous poll: since this poll" "$(json capturedAt)" "$(json fiveHourAbsentSince)"
+
+# --- 39) a sighting in this very second (a poll with the line and one without,
+# back to back) moves too: only a poll that printed the line keeps
+# fiveHourSeenAt at its own capturedAt. The poll starts as a second turns, so
+# that it lands in it; tried until it does, and a failure if it never does.
+same_second() {  # same_second <name> <fiveHour JSON> <key the second goes in>
+  local attempt t
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    previous_poll 180 "$2"
+    t=$(($(date +%s) + 1))
+    edit_snapshot "$3=$t"
+    python3 -c "import time; time.sleep(max(0.0, $t - time.time()))"
+    run_poll "$scratch/week61.txt"
+    if [ "$(json capturedAt)" = "$t" ]; then
+      check "$1: the second before this poll" "$((t - 1))" "$(json fiveHourSeenAt)"
+      return
+    fi
+  done
+  check "$1: a poll that lands in its second" "landed" "missed 10 times"
+}
+same_second "sighting in this poll's second" "$ended" fiveHourSeenAt
+same_second "legacy 5h reading, previous poll in this second" "$legacy_window" capturedAt
+
+# --- 40) the menu's reason for a 5-hour section without a number, end to end:
+# a line whose reset could not be read, then none (the window may stay open 5
+# hours from that line), and a line whose reset lies out of range
+menu_line() {  # menu_line <name> <expected line>
+  local menu
+  menu="$(HOME="$fake_home" AI_USAGE_PRIMARY_PROVIDER=claude "$bin" menu-preview </dev/null)"
+  check "$1" "1" "$(grep -cxF -- "$2" <<<"$menu")"
+}
+previous_poll 180 "$ended"
+printf '%s\n' 'Current session: 3% used' \
+  "Current week (all models): 61% used · resets $weekly_reset (Asia/Seoul)" > "$scratch/session-noreset.txt"
+run_poll "$scratch/session-noreset.txt"
+menu_line "reset not read: menu" "사용률 값 없음 — 5시간 줄의 리셋 시각을 해석하지 못함"
+sleep 1
+run_poll "$scratch/week61.txt"
+check "reset not read, then no line: percentage blanked" '{"resets_at": null, "used_percentage": null}' "$(json fiveHour)"
+menu_line "reset not read, then no line: menu" "사용률 값 없음 — 마지막 조회에 5시간 줄이 없음"
+IFS=$'\t' read -r far_reset _ < <(reset_at $((3 * 86400)) minutes)
+printf '%s\n' "Current session: 30% used · resets $far_reset (Asia/Seoul)" \
+  "Current week (all models): 61% used · resets $weekly_reset (Asia/Seoul)" > "$scratch/session-far.txt"
+run_poll "$scratch/session-far.txt"
+menu_line "reset out of range: menu" "사용률 값 없음 — 5시간 줄의 값이 범위를 벗어남"
 
 if [ "$failures" -ne 0 ]; then
   echo "FAIL: $failures claude-usage-poll assertions failed" >&2

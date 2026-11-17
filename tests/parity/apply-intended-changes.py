@@ -39,6 +39,123 @@ CHANGES = [
         "        w['resets_at'] = None\n"
         "    return w\n",
     ),
+    (
+        # A `/usage` reset instant is stored exactly as printed instead of
+        # being rolled forward by whole windows until it is not in the past.
+        # The text has no year: of last year, this year and next year, the
+        # one that puts the instant closest to now is taken (the earlier on a
+        # tie), skipping a year without that day. Rolling paired an ended
+        # window's percentage with an invented reset just after a reset, and
+        # in late December read "Jan 2" as this year's and pushed it 52 weeks
+        # on: a day early.
+        "tools/poll-usage.sh",
+        "        try:\n"
+        '            dt = datetime.datetime.strptime(f"{text} {now.year}", fmt + " %Y")\n'
+        "        except ValueError:\n"
+        "            continue\n"
+        "        if tz:\n"
+        "            dt = dt.replace(tzinfo=tz)\n"
+        "        ep = dt.timestamp()\n"
+        "        # The printed instant may already have passed (or sit a year back across\n"
+        "        # a Dec/Jan boundary); walk it forward by whole windows.\n"
+        "        while ep < time.time():\n"
+        "            ep += length\n"
+        "        return ep\n",
+        "        best, current = None, time.time()\n"
+        "        for year in (now.year - 1, now.year, now.year + 1):\n"
+        "            try:\n"
+        '                dt = datetime.datetime.strptime(f"{text} {year}", fmt + " %Y")\n'
+        "            except ValueError:\n"
+        "                continue\n"
+        "            if tz:\n"
+        "                dt = dt.replace(tzinfo=tz)\n"
+        "            ep = dt.timestamp()\n"
+        "            if best is None or abs(ep - current) < abs(best - current):\n"
+        "                best = ep\n"
+        "        if best is not None:\n"
+        "            return best\n",
+    ),
+    (
+        # Every poll whose output has a session line, readable or not, stores
+        # its capturedAt as `fiveHourSeenAt`: when a 5-hour window was last
+        # possibly open. The "no 5-hour limit" conclusion judges the previous
+        # poll by it (that conclusion is not mirrored: it never fires here).
+        "tools/poll-usage.sh",
+        "new['fiveHour'] = window(cur.get('fiveHour') or {}, five, five_reset)\n",
+        "new['fiveHour'] = window(cur.get('fiveHour') or {}, five, five_reset)\n"
+        "session_line = re.search(r'^\\s*Current session\\b', out, re.M | re.I) is not None\n"
+        "if session_line:\n"
+        "    new['fiveHourSeenAt'] = new['capturedAt']\n",
+    ),
+    (
+        # A session line that could not be read keeps the stored 5-hour
+        # window's reset only while it is ahead (a passed one would read as
+        # "no window open"), and its percentage not at all: this poll read
+        # none, and an earlier poll's number may not pass for the current one.
+        "tools/poll-usage.sh",
+        "if session_line:\n"
+        "    new['fiveHourSeenAt'] = new['capturedAt']\n",
+        "if session_line:\n"
+        "    new['fiveHourSeenAt'] = new['capturedAt']\n"
+        "if session_line and five is None:\n"
+        "    w = dict(new['fiveHour']) if isinstance(new['fiveHour'], dict) else {}\n"
+        "    w['used_percentage'] = None\n"
+        "    r = w.get('resets_at')\n"
+        "    if not (isinstance(r, (int, float)) and not isinstance(r, bool)\n"
+        "            and r == r and abs(r) != float('inf') and r > time.time()):\n"
+        "        w['resets_at'] = None\n"
+        "    new['fiveHour'] = w\n",
+    ),
+    (
+        # A poll without a session line keeps the stored 5-hour window, but a
+        # percentage whose reset is still ahead, or that has none, loses its
+        # number (no poll printed it as current: the limit may have gone
+        # mid-window); a reset ahead stays. A window without a reset and
+        # without `fiveHourSeenAt` (stored before it existed) is also dated by
+        # the previous poll, so that it can expire. No sighting is as late as
+        # this poll, which printed no session line: one stored that late (a
+        # clock that ran fast) becomes the second before this poll.
+        "tools/poll-usage.sh",
+        "new['sevenDay'] = window(cur.get('sevenDay') or {}, week, week_reset)\n",
+        "\n"
+        "def finite(value):\n"
+        "    return (isinstance(value, (int, float)) and not isinstance(value, bool)\n"
+        "            and value == value and abs(value) != float('inf'))\n"
+        "\n"
+        "if not session_line:\n"
+        "    old = cur.get('fiveHour')\n"
+        "    old_reset = old.get('resets_at') if isinstance(old, dict) else None\n"
+        "    if finite(cur.get('fiveHourSeenAt')) and cur['fiveHourSeenAt'] > new['capturedAt'] - 1:\n"
+        "        new['fiveHourSeenAt'] = new['capturedAt'] - 1\n"
+        "    if finite(old_reset) and old_reset > time.time():\n"
+        "        new['fiveHour'] = dict(old, used_percentage=None)\n"
+        "    elif old is not None and old != {} and not finite(old_reset):\n"
+        "        if isinstance(old, dict):\n"
+        "            new['fiveHour'] = dict(old, used_percentage=None)\n"
+        "        if not finite(cur.get('fiveHourSeenAt')) and finite(cur.get('capturedAt')):\n"
+        "            new['fiveHourSeenAt'] = (cur['capturedAt'] if cur['capturedAt'] <= new['capturedAt'] - 1\n"
+        "                                     else new['capturedAt'] - 1)\n"
+        "new['sevenDay'] = window(cur.get('sevenDay') or {}, week, week_reset)\n",
+    ),
+    (
+        # A poll that printed the all-models weekly line blanks the percentage
+        # and the reset of every stored model bucket it did not print, also
+        # when it printed no bucket at all: `/usage` stopped reporting it, so
+        # it must not stay a live reading or turn up as reset later. Without
+        # that line the buckets stay as they were; printed buckets merge as
+        # before.
+        "tools/poll-usage.sh",
+        "if model_windows:\n"
+        "    merged = dict(cur.get('modelWindows') or {})\n",
+        "stored = cur.get('modelWindows')\n"
+        "merged = dict(stored) if isinstance(stored, dict) else {}\n"
+        "if week is not None and merged:\n"
+        "    for name, w in list(merged.items()):\n"
+        "        if name not in model_windows and isinstance(w, dict):\n"
+        "            merged[name] = dict(w, used_percentage=None, resets_at=None)\n"
+        "    new['modelWindows'] = merged\n"
+        "if model_windows:\n",
+    ),
 ]
 
 

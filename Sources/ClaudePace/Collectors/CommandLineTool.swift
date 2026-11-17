@@ -19,6 +19,7 @@ enum CommandLineTool {
       usage-history-summary [log]         the compact summary the menu shows
       usage-daily-deltas [log]            daily Codex token deltas
       usage-monthly-summary [log] [YYYY-MM]
+      menu-preview                        print the menu as text (reads only: no poll, no writes)
     """
 
     /// The exit status, or nil when ClaudePace should start as the menu bar
@@ -93,6 +94,9 @@ enum CommandLineTool {
         case "usage-monthly-summary":
             let period = argument(1) ?? Shell.seoulMonth()
             return UsageReports.run(.monthly(period: period), log: argument(0) ?? paths.usageLog, environment: environment, io: .console)
+
+        case "menu-preview":
+            return MenuPreview.run(home: home, environment: environment, io: .console)
 
         case "help", "-h", "--help":
             CommandIO.console.out(usage)

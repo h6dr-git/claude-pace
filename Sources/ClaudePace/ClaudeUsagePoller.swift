@@ -9,21 +9,9 @@ final class ClaudeUsagePoller {
     static let shared = ClaudeUsagePoller()
 
     /// What the menu needs to tell "polling right now" from "not polling at
-    /// all" when the reading on screen is old.
-    struct Status {
-        /// Awake time the running poll has taken so far (nil: none running).
-        /// Measured on systemUptime, which stops while the Mac sleeps, so a
-        /// poll that slept along with the Mac is not mistaken for a stuck one.
-        let runningFor: TimeInterval?
-        /// When the last poll started (nil: none since the app launched).
-        let lastAttempt: Date?
-    }
-
-    /// Every `claude` call in a poll is time-limited (CLAUDE_USAGE_TIMEOUT,
-    /// 60s by default), so a whole poll ends within about two minutes. One
-    /// still running after this long means something under those limits is
-    /// stuck, and the menu says so instead of quietly showing the last number.
-    static let stuckAfter: TimeInterval = 5 * 60
+    /// all" when the reading on screen is old. Defined with the menu code
+    /// (Usage.swift), which has to compile without this poller.
+    typealias Status = ClaudePollStatus
 
     private let queue = DispatchQueue(label: "ClaudePace.ClaudeUsagePoller")
     /// Guards the status fields, which the main thread reads while a poll

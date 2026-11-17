@@ -9,6 +9,7 @@ on the wall clock. Everything else is compared byte for byte.
 """
 
 import json
+import math
 import os
 import re
 import sys
@@ -28,7 +29,6 @@ IGNORED = [re.compile(pattern) for pattern in (
 
 # Command output that is JSON (reports and summaries).
 JSON_OUTPUT = re.compile(r"(^|/)_out/\d+-(history|daily|monthly|segment)-[^/]*\.out$")
-WINDOW_LENGTHS = (0, 5 * 3600, 7 * 24 * 3600)
 
 
 def files(root):
@@ -53,6 +53,10 @@ def parse_stream(text):
         values.append(value)
 
 
+def finite(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
 def normalize(value, relative):
     """Replace wall-clock values with markers."""
     name = os.path.basename(relative)
@@ -60,8 +64,16 @@ def normalize(value, relative):
         value = dict(value)
         value.pop("generatedAt", None)
         if name in ("snapshot.json", "snapshot.json.tmp", "claude-collector-state.json", "codex-snapshot.json"):
+            captured = value.get("capturedAt")
             if "capturedAt" in value:
                 value["capturedAt"] = "<time>"
+            # Poll times the snapshot keeps: this poll's own or an earlier
+            # one's, and both runs must agree on which. Anything that is not
+            # a time is compared as it is.
+            for key in ("fiveHourSeenAt", "fiveHourAbsentSince"):
+                if finite(value.get(key)):
+                    own = finite(captured) and value[key] == captured
+                    value[key] = "<capturedAt>" if own else "<time>"
         if name == "codex-snapshot.json" and isinstance(value.get("accountUsageCapturedAt"), (int, float)):
             value["accountUsageCapturedAt"] = "<time>"
         if value.get("source") == "claude-statusline" and str(value.get("event_id", "")).startswith("claude-statusline:"):
@@ -72,17 +84,16 @@ def normalize(value, relative):
     return value
 
 
-def same(a, b, key=None):
+def same(a, b):
+    # Exact, reset instants included: they are stored as printed and no
+    # longer rolled forward from the time of the run, so runs a few seconds
+    # apart agree on them.
     if isinstance(a, bool) or isinstance(b, bool):
         return type(a) is type(b) and a == b
-    if key == "resets_at" and isinstance(a, (int, float)) and isinstance(b, (int, float)):
-        # A reset instant is rolled forward by whole windows from "now"; two
-        # runs a few seconds apart may straddle one boundary.
-        return abs(a - b) in WINDOW_LENGTHS
     if isinstance(a, dict) and isinstance(b, dict):
-        return a.keys() == b.keys() and all(same(a[k], b[k], k) for k in a)
+        return a.keys() == b.keys() and all(same(a[k], b[k]) for k in a)
     if isinstance(a, list) and isinstance(b, list):
-        return len(a) == len(b) and all(same(x, y, key) for x, y in zip(a, b))
+        return len(a) == len(b) and all(same(x, y) for x, y in zip(a, b))
     return a == b
 
 

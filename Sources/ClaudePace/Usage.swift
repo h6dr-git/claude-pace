@@ -1,21 +1,21 @@
-import AppKit
 import Foundation
 
-// The Claude snapshot model lives in ClaudeUsageSnapshot.swift so the
-// provider-selection tests can compile it without pulling in AppKit UI code.
+// Everything the menu says about Claude, without AppKit: the provider-selection
+// tests compile this file next to the snapshot model (ClaudeUsageSnapshot.swift).
+// Drawing stays in Bar.swift; AppController applies MenuComposition's result.
 
 final class SnapshotStore {
     static let shared = SnapshotStore()
     let url: URL
-    init() {
-        url = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/ClaudePace/snapshot.json")
+    init(url: URL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/ClaudePace/snapshot.json")) {
+        self.url = url
     }
     /// The stored reading as it stands now: windows whose reset has passed
     /// since it was taken carry no percentage (see `RLWindow.endingIfPast`).
-    func load() -> Snapshot? {
+    func load(at now: Date = Date()) -> Snapshot? {
         guard let d = try? Data(contentsOf: url) else { return nil }
-        return try? JSONDecoder().decode(Snapshot.self, from: d).droppingEndedWindows()
+        return try? JSONDecoder().decode(Snapshot.self, from: d).droppingEndedWindows(at: now)
     }
 }
 
@@ -26,13 +26,18 @@ enum PaceVerdict { case warmup, under, onpace, over }
 /// A usage window. Window is `length` long and ends at `resetsAt` — holds for
 /// both rolling-7d and fixed-weekly resets.
 struct WindowCalc {
+    static let weekLength: TimeInterval = 7 * 24 * 3600
+    static let fiveHourLength: TimeInterval = 5 * 3600
+
     let used: Double                // 0..100
     let resetsAt: Date
     let length: TimeInterval
+    /// The instant the window is read at.
+    var now = Date()
 
     var windowStart: Date { resetsAt.addingTimeInterval(-length) }
-    var elapsedFrac: Double { min(max(Date().timeIntervalSince(windowStart) / length, 0), 1) }
-    var remaining: TimeInterval { max(resetsAt.timeIntervalSinceNow, 0) }
+    var elapsedFrac: Double { min(max(now.timeIntervalSince(windowStart) / length, 0), 1) }
+    var remaining: TimeInterval { max(resetsAt.timeIntervalSince(now), 0) }
     /// Projected final % if the so-far average rate continues. nil during warm-up.
     var projected: Double? { let f = elapsedFrac; guard f > 0.05 else { return nil }; return used / f }
     var verdict: PaceVerdict {
@@ -45,7 +50,7 @@ struct WindowCalc {
 
 // MARK: - Presentation
 
-enum MenuEntry {
+enum MenuEntry: Equatable {
     case header(String)
     case bar(used: Double, pace: Double?, text: String)
     case line(String)
@@ -53,37 +58,42 @@ enum MenuEntry {
 }
 
 struct UsageView {
+    /// The snapshot as it reads at `now` (ended windows carry no percentage).
     let snapshot: Snapshot?
     /// Whether this app is polling Claude (claude mode). Under another
     /// provider the block is a leftover reading that will not be refreshed.
-    var polled = true
+    let polled: Bool
+    let now: Date
+    /// The window the menu-bar ring shows: its section header says so and
+    /// the tooltip names it first. nil where the ring shows something else.
+    let ring: RingChoice?
+
+    init(snapshot: Snapshot?, polled: Bool = true, now: Date = Date(), ring: RingChoice? = nil) {
+        self.snapshot = snapshot?.droppingEndedWindows(at: now)
+        self.polled = polled
+        self.now = now
+        self.ring = ring
+    }
 
     private func calc(_ window: RLWindow?, length: TimeInterval) -> WindowCalc? {
         guard let window, window.isUsable,
               let u = window.used_percentage, let r = window.resets_at else { return nil }
-        return WindowCalc(used: u, resetsAt: Date(timeIntervalSince1970: r), length: length)
+        return WindowCalc(used: u, resetsAt: Date(timeIntervalSince1970: r), length: length, now: now)
     }
 
-    private var week: WindowCalc? { calc(snapshot?.sevenDay, length: 7 * 24 * 3600) }
-    private var five: WindowCalc? { calc(snapshot?.fiveHour, length: 5 * 3600) }
-
-    /// Menu bar prefers the real-time 5h view. When `/usage` only reports the
-    /// weekly window — or the 5h window has ended — the ring falls back to the
-    /// weekly one rather than drawing a false 0%, and with no usable window at
-    /// all it draws nothing. `dimmed` marks a reading that stopped updating.
-    func menuBarImage(dimmed: Bool) -> NSImage? {
-        guard let w = five ?? week else { return nil }
-        return Bar.ringImage(used: w.used / 100, pace: w.elapsedFrac, dimmed: dimmed)
-    }
+    private var week: WindowCalc? { calc(snapshot?.sevenDay, length: WindowCalc.weekLength) }
+    /// Never set for an account without a 5-hour limit.
+    private var five: WindowCalc? { calc(snapshot?.usableFiveHour, length: WindowCalc.fiveHourLength) }
 
     var toolTip: String {
         guard let snapshot else { return "AI Usage · Claude 조회 대기" }
         var parts: [String] = []
-        if let w = week { parts.append("주 \(pct(w.used))") }
-        if let f = five { parts.append("5h \(pct(f.used))") }
+        if let ring { parts.append("링 \(ring.window.label) \(pct(ring.candidate.used))") }
+        if let w = week, ring?.window != .week { parts.append("주 \(pct(w.used))") }
+        if let f = five, ring?.window != .five { parts.append("5h \(pct(f.used))") }
         guard !parts.isEmpty else { return "AI Usage · Claude 한도 미확인" }
         var tip = "AI Usage · Claude · " + parts.joined(separator: " · ")
-        if let m = snapshot.model { tip += " · \(m)" }
+        if let m = snapshot.displayedModel { tip += " · \(m)" }
         return tip
     }
 
@@ -92,21 +102,23 @@ struct UsageView {
             return [.line("스냅샷 없음"), .line("Claude Code를 한 번 쓰면 채워집니다")]
         }
         var e: [MenuEntry] = []
-        let weekEnded = endedLine(snapshot, snapshot.sevenDay, fiveHour: false)
-        let fiveEnded = endedLine(snapshot, snapshot.fiveHour, fiveHour: true)
+        let weekEnded = endedLine(snapshot.reading(snapshot.sevenDay, at: now), fiveHour: false)
+        // An account without a 5-hour limit has no 5-hour window to end either.
+        let fiveEnded = snapshot.hasNoFiveHourLimit
+            ? nil : endedLine(snapshot.reading(snapshot.fiveHour, at: now), fiveHour: true)
+                ?? fiveHourWithoutNumberLine(snapshot)
         if let w = week {
-            e.append(.header("주간 (7일)"))
-            var d = "사용 \(pct(w.used))"
-            if let p = w.projected { d += " · 예상 \(pct(p)) \(verdict(w.verdict))" }
-            e.append(.bar(used: w.used / 100, pace: w.elapsedFrac, text: d))
-            e.append(.line("리셋까지 \(dur(w.remaining)) (\(clock(w.resetsAt))) · 경과 \(pct(w.elapsedFrac * 100))"))
+            e.append(.header(title("주간 전체 (7일)", .week)))
+            appendWeekly(w, resetLine: true, to: &e)
         } else if let weekEnded {
-            e.append(.header("주간 (7일)"))
+            e.append(.header("주간 전체 (7일)"))
             e.append(.line(weekEnded))
         }
+        // Neither is set for an account without a 5-hour limit: that is said
+        // once, after the limits that do apply (below the buckets).
         if let f = five {
             e.append(.separator)
-            e.append(.header("5시간"))
+            e.append(.header(title("5시간", .five)))
             e.append(.bar(used: f.used / 100, pace: f.elapsedFrac, text: "사용 \(pct(f.used))"))
             e.append(.line("리셋까지 \(dur(f.remaining)) (\(clock(f.resetsAt)))"))
         } else if let fiveEnded {
@@ -114,45 +126,158 @@ struct UsageView {
             e.append(.header("5시간"))
             e.append(.line(fiveEnded))
         }
-        let modelLines = modelWindowLines(snapshot)
-        if !modelLines.isEmpty {
+        let buckets = bucketEntries(snapshot)
+        e.append(contentsOf: buckets)
+        if snapshot.hasNoFiveHourLimit {
             e.append(.separator)
-            e.append(.header("모델별 주간"))
-            e.append(contentsOf: modelLines.map { MenuEntry.line($0) })
+            e.append(.line(noFiveHourLimitLine(since: snapshot.fiveHourAbsentSince)))
         }
-        if week == nil && five == nil && weekEnded == nil && fiveEnded == nil {
+        if week == nil && five == nil && weekEnded == nil && fiveEnded == nil && buckets.isEmpty {
             e.append(.line("한도 값 없음 — 공식 조회에서 퍼센트를 받지 못함"))
         }
         e.append(.separator)
         e.append(.line("│ 세로선 = 지금 페이스 (여기까지면 딱 맞음)"))
+        if let pinned = ring?.fellBackFrom {
+            e.append(.line("링: \(pinned.label) 지금 값 없음 · 자동으로 표시"))
+        }
         var foot = ""
-        if let c = snapshot.capturedAt { foot = "\(dur(Date().timeIntervalSince1970 - c)) 전 갱신" }
-        if let m = snapshot.model { foot += foot.isEmpty ? m : " · \(m)" }
+        if let c = snapshot.capturedAt { foot = "\(dur(now.timeIntervalSince1970 - c)) 전 갱신" }
+        if let m = snapshot.displayedModel { foot += foot.isEmpty ? m : " · \(m)" }
         if !foot.isEmpty { e.append(.line(foot)) }
+        return UsageView.withoutStraySeparators(e)
+    }
+
+    /// Each section above opens with its own separator, so one that is left
+    /// out (no weekly reading, say) would leave a divider right under the
+    /// block's header, or two in a row under the freshness block. Dropped
+    /// here once, for every section.
+    private static func withoutStraySeparators(_ entries: [MenuEntry]) -> [MenuEntry] {
+        var kept: [MenuEntry] = []
+        for entry in entries {
+            if entry == .separator, kept.last == nil || kept.last == .separator { continue }
+            kept.append(entry)
+        }
+        return kept
+    }
+
+    /// A weekly window's bar, its reset line (unless left out) and the
+    /// planning line under them.
+    private func appendWeekly(_ w: WindowCalc, resetLine: Bool, to e: inout [MenuEntry]) {
+        var d = "사용 \(pct(w.used))"
+        if let p = w.projected { d += " · 예상 \(pct(p)) \(verdict(w.verdict))" }
+        e.append(.bar(used: w.used / 100, pace: w.elapsedFrac, text: d))
+        if resetLine {
+            e.append(.line("리셋까지 \(dur(w.remaining)) (\(clock(w.resetsAt))) · 경과 \(pct(w.elapsedFrac * 100))"))
+        }
+        if let plan = UsageView.planningLine(used: w.used, remaining: w.remaining) {
+            e.append(.line(plan))
+        }
+    }
+
+    /// Each model's weekly bucket, shown like the all-models week. Its reset
+    /// line is left out when it shares that window's reset (the usual case).
+    /// Legacy fixed Opus/Sonnet fields come in through `modelBuckets`.
+    private func bucketEntries(_ snapshot: Snapshot) -> [MenuEntry] {
+        var e: [MenuEntry] = []
+        for bucket in snapshot.modelBuckets {
+            let name = "\(bucket.name) 주간"
+            let reading = snapshot.reading(bucket.window, at: now)
+            switch reading {
+            case .current(let used, let resetsAt):
+                let w = WindowCalc(
+                    used: used, resetsAt: Date(timeIntervalSince1970: resetsAt),
+                    length: WindowCalc.weekLength, now: now
+                )
+                e.append(.separator)
+                e.append(.header(title(name, .model(bucket.name))))
+                appendWeekly(w, resetLine: !sharesWeeklyReset(resetsAt), to: &e)
+            case .endedSinceLastPoll(let endedAt):
+                appendEnded(name, endedAt: endedAt, to: &e)
+            case .noOpenWindow(let endedAt) where UsageView.printedBeforeReset(endedAt, capturedAt: snapshot.capturedAt):
+                // The poll ran into the reset: `/usage` printed the bucket a
+                // moment before it, the capture time was stamped a moment
+                // after. It has ended since that output, as above.
+                appendEnded(name, endedAt: endedAt, to: &e)
+            case .noOpenWindow, .unavailable:
+                // A poll well after its reset left the bucket as it was, or
+                // one that printed the all-models line left it out and the
+                // collector cleared its percentage and reset: `/usage` no
+                // longer prints it (a renamed or retired model).
+                continue
+            }
+        }
         return e
     }
 
-    /// Per-model weekly buckets. Keeps the legacy fixed Opus/Sonnet fields
-    /// working for snapshots written by the statusLine bridge.
-    private func modelWindowLines(_ snapshot: Snapshot) -> [String] {
-        var named: [(String, RLWindow)] = []
-        if let o = snapshot.sevenDayOpus { named.append(("Opus", o)) }
-        if let s = snapshot.sevenDaySonnet { named.append(("Sonnet", s)) }
-        for (name, window) in (snapshot.modelWindows ?? [:]).sorted(by: { $0.key < $1.key }) {
-            guard !named.contains(where: { $0.0.caseInsensitiveCompare(name) == .orderedSame }) else { continue }
-            named.append((name, window))
+    /// How long after a reset a capture time can still belong to the output
+    /// that printed the window before it: capturedAt is stamped once the CLI
+    /// has returned, a little after `/usage` looked.
+    static let captureAfterOutputSlack: TimeInterval = 120
+
+    private static func printedBeforeReset(_ endedAt: Double, capturedAt: Double?) -> Bool {
+        guard let capturedAt, capturedAt.isFinite else { return false }
+        return capturedAt - endedAt < captureAfterOutputSlack
+    }
+
+    /// A bucket whose reset has passed since `/usage` printed it: no
+    /// percentage, just when it reset.
+    private func appendEnded(_ name: String, endedAt: Double, to e: inout [MenuEntry]) {
+        guard let ended = endedLine(.endedSinceLastPoll(endedAt: endedAt), fiveHour: false) else { return }
+        e.append(.separator)
+        e.append(.header(name))
+        e.append(.line(ended))
+    }
+
+    private func sharesWeeklyReset(_ resetsAt: Double) -> Bool {
+        guard let week else { return false }
+        return abs(week.resetsAt.timeIntervalSince1970 - resetsAt) < 60
+    }
+
+    /// `base`, marked when the menu-bar ring shows this window.
+    private func title(_ base: String, _ window: RingWindow) -> String {
+        guard let ring, ring.window.matches(window) else { return base }
+        return base + " · 링"
+    }
+
+    /// Why the latest poll left the 5-hour window without a number, when it
+    /// did, so the section says so instead of just going missing (drawn
+    /// without a bar). Either the poll printed a session line that gave no
+    /// usable window (told apart by what the line gave, as stored), or it
+    /// printed none while the stored window may still be open: its reset is
+    /// ahead, or, with no reset (what an unreadable line leaves), it is under
+    /// 5 hours since a poll printed the line. The collector clears the
+    /// percentage of such a window.
+    private func fiveHourWithoutNumberLine(_ snapshot: Snapshot) -> String? {
+        guard snapshot.source == "usage-poll", let window = snapshot.fiveHour else { return nil }
+        if snapshot.latestPollPrintedSessionLine {
+            let printed = snapshot.storedFiveHour ?? window
+            if printed.used_percentage == nil { return "사용률 값 없음 — 5시간 줄을 해석하지 못함" }
+            if printed.resets_at == nil { return "사용률 값 없음 — 5시간 줄의 리셋 시각을 해석하지 못함" }
+            return "사용률 값 없음 — 5시간 줄의 값이 범위를 벗어남"
         }
-        return named.compactMap { name, window in
-            guard window.isUsable, let used = window.used_percentage else { return nil }
-            return "\(name) 주간 \(pct(used))"
+        let missing = "사용률 값 없음 — 마지막 조회에 5시간 줄이 없음"
+        if let reset = window.resets_at {
+            guard window.used_percentage == nil, reset.isFinite, reset > now.timeIntervalSince1970 else { return nil }
+            return "\(missing) (창은 \(clock(Date(timeIntervalSince1970: reset)))까지)"
         }
+        guard let seen = snapshot.fiveHourSeenAt, seen.isFinite,
+              seen + WindowCalc.fiveHourLength > now.timeIntervalSince1970 else { return nil }
+        return missing
+    }
+
+    private func noFiveHourLimitLine(since: Double?) -> String {
+        var line = "5시간 한도 없는 계정 · 주간 한도만 적용"
+        if let since, since.isFinite, since > 0 {
+            line += " (\(day(Date(timeIntervalSince1970: since))) 확인)"
+        }
+        return line
     }
 
     /// The line for a window whose reset has passed: say it ended and where
     /// the new value comes from, instead of drawing it as 0%.
-    private func endedLine(_ snapshot: Snapshot, _ window: RLWindow?, fiveHour: Bool) -> String? {
+    private func endedLine(_ reading: WindowReading, fiveHour: Bool) -> String? {
         let next = polled ? "새 값은 다음 조회 때" : "이 모드에선 새로 조회하지 않음"
-        switch snapshot.reading(window) {
+        switch reading {
         case .endedSinceLastPoll(let endedAt):
             let when = clock(Date(timeIntervalSince1970: endedAt))
             return fiveHour ? "\(when)에 창 끝남 · \(next)" : "\(when)에 리셋됨 · \(next)"
@@ -166,9 +291,51 @@ struct UsageView {
             return nil
         }
     }
+
+    /// What is left of a weekly window and the even rate that lands exactly
+    /// on 100% at the reset: per day with a day or more to go, per hour in
+    /// the last day. In the last hour a per-hour rate would exceed what is
+    /// left, so the line gives the time to the reset instead, in whole
+    /// minutes counted like the reset line above it (`dur`), so the two
+    /// never disagree. Plain arithmetic on the official values; nil once
+    /// there is nothing to plan (used up, or under a minute to the reset).
+    static func planningLine(used: Double, remaining: TimeInterval) -> String? {
+        guard used.isFinite, (0...100).contains(used), remaining.isFinite, (0..<1e12).contains(remaining) else { return nil }
+        let seconds = Int(remaining.rounded())
+        guard seconds >= 60 else { return nil }
+        let shown = Int(used.rounded())
+        // The bar already says "사용 100%" from 99.5 up: nothing left to plan.
+        guard shown < 100 else { return nil }
+        let left = "남은 \(100 - shown)%"
+        let hour = 3600
+        let day = 24 * hour
+        guard seconds >= hour else {
+            return "\(left) · 리셋까지 \(seconds / 60)분"
+        }
+        let perDay = seconds >= day
+        let rate = (100 - used) / (remaining / Double(perDay ? day : hour))
+        return "\(left) · 리셋까지 \(perDay ? "하루" : "시간당") \(rateText(rate))"
+    }
 }
 
 // MARK: - Freshness
+
+/// What the menu needs to tell "polling right now" from "not polling at
+/// all" when the reading on screen is old (`ClaudeUsagePoller.Status`).
+struct ClaudePollStatus: Equatable {
+    /// Awake time the running poll has taken so far (nil: none running).
+    /// Measured on systemUptime, which stops while the Mac sleeps, so a
+    /// poll that slept along with the Mac is not mistaken for a stuck one.
+    let runningFor: TimeInterval?
+    /// When the last poll started (nil: none since the app launched).
+    let lastAttempt: Date?
+
+    /// Every `claude` call in a poll is time-limited (CLAUDE_USAGE_TIMEOUT,
+    /// 60s by default), so a whole poll ends within about two minutes. One
+    /// still running after this long means something under those limits is
+    /// stuck, and the menu says so instead of quietly showing the last number.
+    static let stuckAfter: TimeInterval = 5 * 60
+}
 
 /// The block at the top of the menu that says whether the numbers under it
 /// are current. Nothing when they are; otherwise how old they are and whether
@@ -177,11 +344,11 @@ struct UsageView {
 enum FreshnessPresentation {
     static func entries(
         snapshot: Snapshot?,
-        poll: ClaudeUsagePoller.Status,
+        poll: ClaudePollStatus,
         numbersShown: Bool,
         now: Date = Date()
     ) -> [MenuEntry] {
-        if let running = poll.runningFor, running > ClaudeUsagePoller.stuckAfter {
+        if let running = poll.runningFor, running > ClaudePollStatus.stuckAfter {
             return [
                 .header("⚠ 조회가 멈춤"),
                 .line("조회 하나가 \(dur(running))째 끝나지 않음 — 앱을 다시 시작해 주세요")
@@ -232,7 +399,25 @@ private func verdict(_ v: PaceVerdict) -> String {
     }
 }
 
+/// A planning rate: whole percent from 10% up, below that at most one
+/// decimal with no trailing ".0". One that rounds to nothing says so rather
+/// than reading as 0%.
+private func rateText(_ rate: Double) -> String {
+    let tenths = (rate * 10).rounded()
+    guard tenths >= 1 else { return "0.1% 미만" }
+    if tenths >= 100 { return "\(Int(rate.rounded()))%씩" }
+    if tenths.truncatingRemainder(dividingBy: 10) == 0 { return "\(Int(tenths / 10))%씩" }
+    return String(format: "%.1f%%씩", tenths / 10)
+}
+
+/// A span as the menu says it ("1일 4시간"). Nothing real here comes near a
+/// century, so one that does (a capture time far off) reads "?" rather than
+/// trapping on its way to Int. An age below zero means the clock was set
+/// back since that instant: within the minute the menu allows for that it
+/// reads as none, beyond it as "?", never as "-29초".
 private func dur(_ s: TimeInterval) -> String {
+    guard s.isFinite, abs(s) < 100 * 365 * 24 * 3600 else { return "?" }
+    if s < 0 { return s >= -60 ? "0초" : "?" }
     let t = Int(s.rounded())
     if t < 60 { return "\(t)초" }
     let m = t / 60
@@ -246,5 +431,11 @@ private func dur(_ s: TimeInterval) -> String {
 private func clock(_ d: Date) -> String {
     let f = DateFormatter()
     f.dateFormat = "M/d HH:mm"
+    return f.string(from: d)
+}
+
+private func day(_ d: Date) -> String {
+    let f = DateFormatter()
+    f.dateFormat = "M/d"
     return f.string(from: d)
 }

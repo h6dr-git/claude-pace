@@ -66,7 +66,7 @@ struct CodexUsageView {
     }
 
     private var menuWindow: CodexRateLimitWindow? {
-        mainLimit?.primary ?? mainLimit?.secondary
+        snapshot?.menuBarWindow
     }
 
     var menuBarImage: NSImage? {
@@ -179,7 +179,12 @@ struct CodexUsageView {
             let label = "\(name) · \(windowLabel(window.windowDurationMins))"
             if index > 0 { entries.append(.separator) }
             entries.append(.header(label))
-            let used = window.usedPercent ?? 0
+            // No percentage is no reading: said as such, never drawn as 0%
+            // with a projection made from that 0%.
+            guard let used = window.usedPercent, used.isFinite else {
+                entries.append(.line("사용률 값 없음 — 조회값에 퍼센트가 없음"))
+                continue
+            }
             let calc = calculation(for: window)
             var detail = "사용 \(codexPercent(used))"
             if let projected = calc?.projected {
@@ -192,12 +197,14 @@ struct CodexUsageView {
         }
     }
 
+    /// nil without a percentage: there is no pace to work out from nothing.
     private func calculation(for window: CodexRateLimitWindow) -> WindowCalc? {
-        guard let reset = window.resetsAt,
+        guard let used = window.usedPercent, used.isFinite,
+              let reset = window.resetsAt,
               let minutes = window.windowDurationMins,
               minutes > 0 else { return nil }
         return WindowCalc(
-            used: window.usedPercent ?? 0,
+            used: used,
             resetsAt: Date(timeIntervalSince1970: reset),
             length: minutes * 60
         )
@@ -216,8 +223,16 @@ private func displayPlan(_ plan: String?) -> String? {
     return plan.replacingOccurrences(of: "_", with: " ").capitalized
 }
 
+// The numbers below come straight from codex-snapshot.json. One no real
+// limit comes near (1e19, say) reads "?" rather than trapping on its way to
+// Int.
+
+/// Longer than any real window or wait: a century.
+private let codexCentury: TimeInterval = 100 * 365 * 24 * 3600
+
 private func windowLabel(_ minutes: Double?) -> String {
     guard let minutes, minutes > 0 else { return "사용량" }
+    guard minutes.isFinite, minutes * 60 < codexCentury else { return "?" }
     let rounded = Int(minutes.rounded())
     if rounded % 1440 == 0 { return "\(rounded / 1440)일" }
     if rounded % 60 == 0 { return "\(rounded / 60)시간" }
@@ -225,7 +240,8 @@ private func windowLabel(_ minutes: Double?) -> String {
 }
 
 private func codexPercent(_ value: Double) -> String {
-    "\(Int(value.rounded()))%"
+    guard value.isFinite, abs(value) < 1e6 else { return "?" }
+    return "\(Int(value.rounded()))%"
 }
 
 private func codexVerdict(_ verdict: PaceVerdict) -> String {
@@ -238,6 +254,7 @@ private func codexVerdict(_ verdict: PaceVerdict) -> String {
 }
 
 private func codexDuration(_ seconds: TimeInterval) -> String {
+    guard seconds.isFinite, abs(seconds) < codexCentury else { return "?" }
     let total = max(Int(seconds.rounded()), 0)
     if total < 60 { return "\(total)초" }
     let minutes = total / 60
@@ -255,7 +272,9 @@ private func codexDuration(_ seconds: TimeInterval) -> String {
 private func codexClock(_ date: Date) -> String {
     let formatter = DateFormatter()
     formatter.dateFormat = "M/d HH:mm"
-    return formatter.string(from: date)
+    // The formatter gives up on an instant that far off (an empty string).
+    let text = formatter.string(from: date)
+    return text.isEmpty ? "?" : text
 }
 
 private func codexNumber(_ value: Int) -> String {
