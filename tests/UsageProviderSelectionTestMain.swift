@@ -40,6 +40,8 @@ struct UsageProviderSelectionTestMain {
         try testRingSubmenuOptions()
         try testCompositionKeepsOtherProvidersAsTheyWere()
         try testPreviewText()
+        testOutOfRangeResetsAreNoReading()
+        testAbsurdTimesNeverTrap()
 
         guard failures == 0 else {
             fputs("FAIL: \(failures) usage-provider assertions failed\n", stderr)
@@ -1141,6 +1143,92 @@ struct UsageProviderSelectionTestMain {
             codexToolTip: "AI Usage · Codex 42%", now: now
         )
         expect(codex.previewText.hasSuffix("ring: Codex 42%\ntooltip: AI Usage · Codex 42%"), "Codex ring line")
+    }
+
+    /// An absurd but finite reset (1e19) used to pass for a current reading
+    /// and trap on its way to a duration. Any reset further ahead than its
+    /// window reaches is no reading now.
+    private static func testOutOfRangeResetsAreNoReading() {
+        let t = now.timeIntervalSince1970
+        let weekly = RLWindow(used_percentage: 60, resets_at: t + 28 * 3600)
+        let absurd = RLWindow(used_percentage: 50, resets_at: 1e19)
+        func snapshot(five: RLWindow? = nil, week: RLWindow? = nil, models: [String: RLWindow]? = nil) -> Snapshot {
+            Snapshot(
+                capturedAt: t - 60, fiveHour: five, sevenDay: week,
+                sevenDayOpus: nil, sevenDaySonnet: nil, modelWindows: models,
+                model: nil, source: "usage-poll"
+            )
+        }
+
+        let bucket = snapshot(week: weekly, models: ["Fable": absurd])
+        let read = bucket.droppingEndedWindows(at: now)
+        expect(read.modelWindows?["Fable"]?.used_percentage == nil, "a bucket reset of 1e19 loses its percentage")
+        expect(read.usableModelBuckets.isEmpty, "and is no usable bucket")
+        let composition = MenuComposition.compose(providerMode: .claude, claudeSnapshot: bucket, now: now)
+        expect(!texts(composition.entries).contains { $0.contains("Fable") }, "the bucket is not shown: \(texts(composition.entries))")
+        expectEqual(composition.ring?.window, .week, "nor drives the ring")
+        expectEqual(composition.ringOptions.map(\.title), ["자동 (가장 많이 쓴 한도)", "주간 전체"], "nor is offered to pin")
+        expect(
+            composition.previewText.hasSuffix("ring: 주간 전체 60%\ntooltip: AI Usage · Claude · 링 주간 전체 60%"),
+            "the preview draws the week: \(composition.previewText)"
+        )
+
+        let onlyBucket = snapshot(models: ["Fable": absurd])
+        expect(!onlyBucket.droppingEndedWindows(at: now).hasUsableWindow, "a bucket-only reading with that reset has nothing usable")
+        let nothing = MenuComposition.compose(providerMode: .claude, claudeSnapshot: onlyBucket, now: now)
+        expectEqual(nothing.image, .unavailable(accessibilityDescription: "Claude 사용량 확인 불가"), "so the ring draws ?")
+        expect(
+            texts(nothing.entries).contains("지금 쓸 수 있는 한도 값 없음 — 리셋이 지났거나 조회값에 퍼센트가 없음"),
+            "and the menu says there is no usable value"
+        )
+
+        // The all-models week and the 5-hour window, the same way.
+        let fiveOpen = RLWindow(used_percentage: 22, resets_at: t + 3600)
+        let weekEntries = UsageView(snapshot: snapshot(five: fiveOpen, week: absurd), now: now).entries
+        expect(section("주간 (7일)", in: weekEntries) == nil, "a weekly reset of 1e19 shows no weekly section")
+        expect(section("5시간", in: weekEntries) != nil, "while the 5-hour reading still shows")
+        let fiveEntries = UsageView(snapshot: snapshot(five: absurd, week: weekly), now: now).entries
+        expect(section("5시간", in: fiveEntries) == nil, "a 5-hour reset of 1e19 shows no 5-hour section")
+        expect(section("주간 (7일)", in: fiveEntries) != nil, "while the week still shows")
+
+        // The bound: the window's own length plus a day of slack.
+        func kept(_ reset: Double, _ length: TimeInterval) -> Bool {
+            RLWindow(used_percentage: 50, resets_at: reset).blankIfOutOfRange(length: length, at: now).isUsable
+        }
+        let weekLimit = t + WindowCalc.weekLength + RLWindow.resetSlack
+        expect(kept(weekLimit, WindowCalc.weekLength), "a weekly reset at the bound is a reading")
+        expect(!kept(weekLimit + 1, WindowCalc.weekLength), "one second further is not")
+        expect(!kept(t + 40 * 86_400, WindowCalc.weekLength), "no weekly reset 40 days out")
+        expect(!kept(1e11, WindowCalc.weekLength), "nor one in the year 5138")
+        let fiveLimit = t + WindowCalc.fiveHourLength + RLWindow.resetSlack
+        expect(kept(fiveLimit, WindowCalc.fiveHourLength), "a 5-hour reset at the bound is a reading")
+        expect(!kept(fiveLimit + 1, WindowCalc.fiveHourLength), "one second further is not")
+        let ended = RLWindow(used_percentage: 45, resets_at: t - 60).endingIfPast(at: now)
+        expectEqual(ended.blankIfOutOfRange(length: WindowCalc.weekLength, at: now), ended, "a past reset stays an ended window")
+    }
+
+    /// Capture and attempt times far off used to trap when their age became
+    /// a duration; that age reads "?" instead.
+    private static func testAbsurdTimesNeverTrap() {
+        let ancient = makeClaudeSnapshot(capturedAt: -1e19)
+        let freshness = texts(FreshnessPresentation.entries(
+            snapshot: ancient,
+            poll: ClaudePollStatus(runningFor: nil, lastAttempt: Date(timeIntervalSince1970: 1e19)),
+            numbersShown: false, now: now
+        ))
+        expect(freshness.contains { $0.hasPrefix("마지막 값은 ? 전") }, "an absurd capture time has no age: \(freshness)")
+        expect(freshness.contains("마지막 조회 시도 ? 전"), "nor an absurd attempt time")
+        let claude = MenuComposition.compose(providerMode: .claude, claudeSnapshot: ancient, now: now)
+        expectEqual(claude.image, .unavailable(accessibilityDescription: "Claude 사용량 확인 불가"), "such a reading draws ?")
+
+        // Another provider keeps Claude's block for a capture in the future
+        // (as before); its footer gets no age either.
+        let future = MenuComposition.compose(
+            providerMode: .codex, claudeSnapshot: makeClaudeSnapshot(capturedAt: 1e19), now: now
+        )
+        expect(texts(future.entries).contains("? 전 갱신 · Opus 5"), "footer of a far-future capture: \(texts(future.entries))")
+
+        expect(UsageView.planningLine(used: 1e19, remaining: 86_400) == nil, "an absurd percentage plans nothing")
     }
 
     private static func decideClaude(

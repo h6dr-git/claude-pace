@@ -231,7 +231,7 @@ struct UsageView {
     /// the last day. Plain arithmetic on the official values; nil once there
     /// is nothing to plan (used up, or under a minute to the reset).
     static func planningLine(used: Double, remaining: TimeInterval) -> String? {
-        guard used.isFinite, used >= 0, remaining.isFinite, remaining >= 60 else { return nil }
+        guard used.isFinite, (0...100).contains(used), remaining.isFinite, remaining >= 60 else { return nil }
         let shown = Int(used.rounded())
         // The bar already says "사용 100%" from 99.5 up: nothing left to plan.
         guard shown < 100 else { return nil }
@@ -332,7 +332,11 @@ private func rateText(_ rate: Double) -> String {
     return String(format: "%.1f%%씩", tenths / 10)
 }
 
+/// A span as the menu says it ("1일 4시간"). Nothing real here comes near a
+/// century, so one that does (a capture time far off) reads "?" rather than
+/// trapping on its way to Int.
 private func dur(_ s: TimeInterval) -> String {
+    guard s.isFinite, abs(s) < 100 * 365 * 24 * 3600 else { return "?" }
     let t = Int(s.rounded())
     if t < 60 { return "\(t)초" }
     let m = t / 60

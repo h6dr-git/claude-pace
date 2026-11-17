@@ -241,6 +241,37 @@ line "empty home" "tooltip: Claude 사용량: 공식 조회값 없음"
 [ -z "$(find "$empty" -mindepth 1 -print)" ] || fail "empty home: menu-preview created files"
 dump "empty home" "$mark"
 
+# --- 10) a reset no official source prints (1e19) is no reading, not a crash
+cat > "$app/snapshot.json" <<JSON
+{"capturedAt": $captured, "fiveHour": null, "fiveHourAbsentSince": $absent_since,
+ "sevenDay": {"used_percentage": 60, "resets_at": $week_reset}, "sevenDayOpus": null, "sevenDaySonnet": null,
+ "modelWindows": {"Fable": {"used_percentage": 50, "resets_at": 1e19}}, "source": "usage-poll"}
+JSON
+write_state "$captured"
+mark=$failures
+preview claude
+check_run "absurd bucket reset"
+line "absurd bucket reset" "주간 (7일) · 링"
+line "absurd bucket reset" "ring: 주간 전체 60%"
+line "absurd bucket reset" "메뉴바 링 ▸ ✓자동 (가장 많이 쓴 한도) | 주간 전체"
+absent "absurd bucket reset" "Fable"
+dump "absurd bucket reset" "$mark"
+
+# --- 11) an absurd last-attempt time under an old reading: no age, not a crash
+cat > "$app/snapshot.json" <<JSON
+{"capturedAt": $old, "fiveHour": null, "fiveHourAbsentSince": $absent_since,
+ "sevenDay": {"used_percentage": 60, "resets_at": $week_reset}, "sevenDayOpus": null, "sevenDaySonnet": null,
+ "modelWindows": {"Fable": {"used_percentage": 91, "resets_at": $week_reset}}, "source": "usage-poll"}
+JSON
+write_state 1e19
+mark=$failures
+preview claude
+check_run "absurd attempt time"
+line "absurd attempt time" "⚠ 갱신 멈춤"
+line "absurd attempt time" "마지막 조회 시도 ? 전"
+line "absurd attempt time" "ring: Fable 주간 91%"
+dump "absurd attempt time" "$mark"
+
 if [ "$failures" -ne 0 ]; then
   echo "FAIL: $failures menu-preview assertions failed" >&2
   exit 1

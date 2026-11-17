@@ -28,11 +28,30 @@ struct RLWindow: Codable, Equatable {
 
     /// A window is only usable when the official source gave a finite
     /// percentage inside 0...100 *and* a reset instant to measure pace against.
-    /// Anything else is treated as "no reading", never as 0% used.
+    /// Anything else is treated as "no reading", never as 0% used. (A reset
+    /// further ahead than its window reaches is blanked by
+    /// `Snapshot.droppingEndedWindows`, see `blankIfOutOfRange`.)
     var isUsable: Bool {
         guard let used = used_percentage, used.isFinite, (0...100).contains(used) else { return false }
         guard let reset = resets_at, reset.isFinite else { return false }
         return true
+    }
+
+    /// How much further than its own length a reset may lie ahead of `now`
+    /// and still be a reading: clock skew between capture and display, and a
+    /// reset `/usage` printed in a time zone the collector could not name.
+    static let resetSlack: TimeInterval = 24 * 3600
+
+    /// No reading at all when the reset lies further ahead of `now` than a
+    /// window of `length` reaches. No official source prints such a reset (a
+    /// weekly window resets within the week), so it is out of range like a
+    /// percentage over 100 — and an absurd one (1e19) cannot even be shown
+    /// as a duration. A reset in the past is left to `endingIfPast`.
+    func blankIfOutOfRange(length: TimeInterval, at now: Date = Date()) -> RLWindow {
+        guard let reset = resets_at, reset - now.timeIntervalSince1970 > length + RLWindow.resetSlack else {
+            return self
+        }
+        return RLWindow(used_percentage: nil, resets_at: nil)
     }
 }
 
@@ -103,15 +122,21 @@ struct Snapshot: Codable {
     }
 
     /// The snapshot as it reads at `now`: windows whose reset has passed keep
-    /// their reset instant but lose their percentage (see `endingIfPast`).
+    /// their reset instant but lose their percentage (see `endingIfPast`),
+    /// and a window whose reset lies further ahead than it reaches is no
+    /// reading at all (see `blankIfOutOfRange`).
     func droppingEndedWindows(at now: Date = Date()) -> Snapshot {
-        Snapshot(
+        func read(_ window: RLWindow, length: TimeInterval) -> RLWindow {
+            window.endingIfPast(at: now).blankIfOutOfRange(length: length, at: now)
+        }
+        let week = WindowCalc.weekLength
+        return Snapshot(
             capturedAt: capturedAt,
-            fiveHour: fiveHour?.endingIfPast(at: now),
-            sevenDay: sevenDay?.endingIfPast(at: now),
-            sevenDayOpus: sevenDayOpus?.endingIfPast(at: now),
-            sevenDaySonnet: sevenDaySonnet?.endingIfPast(at: now),
-            modelWindows: modelWindows?.mapValues { $0.endingIfPast(at: now) },
+            fiveHour: fiveHour.map { read($0, length: WindowCalc.fiveHourLength) },
+            sevenDay: sevenDay.map { read($0, length: week) },
+            sevenDayOpus: sevenDayOpus.map { read($0, length: week) },
+            sevenDaySonnet: sevenDaySonnet.map { read($0, length: week) },
+            modelWindows: modelWindows?.mapValues { read($0, length: week) },
             model: model,
             fiveHourAbsentSince: fiveHourAbsentSince,
             source: source
