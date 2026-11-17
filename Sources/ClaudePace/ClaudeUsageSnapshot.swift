@@ -75,6 +75,9 @@ struct Snapshot: Codable {
     /// set, and it goes away as soon as `/usage` prints a "Current session"
     /// line again.
     let fiveHourAbsentSince: Double?
+    /// The capture time of the last `/usage` poll that printed a "Current
+    /// session" line, readable or not (epoch seconds; the poll only).
+    let fiveHourSeenAt: Double?
     /// Who wrote the snapshot: "usage-poll" for the `/usage` collector,
     /// nothing for the statusLine bridge.
     let source: String?
@@ -88,6 +91,7 @@ struct Snapshot: Codable {
         modelWindows: [String: RLWindow]?,
         model: String?,
         fiveHourAbsentSince: Double? = nil,
+        fiveHourSeenAt: Double? = nil,
         source: String? = nil
     ) {
         self.capturedAt = capturedAt
@@ -98,12 +102,13 @@ struct Snapshot: Codable {
         self.modelWindows = modelWindows
         self.model = model
         self.fiveHourAbsentSince = fiveHourAbsentSince
+        self.fiveHourSeenAt = fiveHourSeenAt
         self.source = source
     }
 
     private enum CodingKeys: String, CodingKey {
         case capturedAt, fiveHour, sevenDay, sevenDayOpus, sevenDaySonnet, modelWindows, model
-        case fiveHourAbsentSince, source
+        case fiveHourAbsentSince, fiveHourSeenAt, source
     }
 
     init(from decoder: Decoder) throws {
@@ -118,6 +123,7 @@ struct Snapshot: Codable {
         // Extras on top of the readings: one of the wrong type must not cost
         // the whole snapshot, it just reads as absent.
         fiveHourAbsentSince = try? c.decodeIfPresent(Double.self, forKey: .fiveHourAbsentSince)
+        fiveHourSeenAt = try? c.decodeIfPresent(Double.self, forKey: .fiveHourSeenAt)
         source = try? c.decodeIfPresent(String.self, forKey: .source)
     }
 
@@ -139,6 +145,7 @@ struct Snapshot: Codable {
             modelWindows: modelWindows?.mapValues { read($0, length: week) },
             model: model,
             fiveHourAbsentSince: fiveHourAbsentSince,
+            fiveHourSeenAt: fiveHourSeenAt,
             source: source
         )
     }
@@ -146,6 +153,13 @@ struct Snapshot: Codable {
     /// The collector found no 5-hour limit on this account: there is no
     /// 5-hour window to show, ended or otherwise.
     var hasNoFiveHourLimit: Bool { fiveHourAbsentSince != nil }
+
+    /// The poll that wrote this snapshot printed a session line: one it
+    /// could not read, when there is no 5-hour reading to go with it.
+    var latestPollPrintedSessionLine: Bool {
+        guard source == "usage-poll", let seen = fiveHourSeenAt, let capturedAt else { return false }
+        return seen == capturedAt
+    }
 
     /// `model` when it describes the reading. The `/usage` poll leaves the
     /// statusLine era's value behind and never updates it.

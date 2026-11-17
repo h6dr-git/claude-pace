@@ -931,7 +931,16 @@ struct UsageProviderSelectionTestMain {
         expectEqual(UsageView.planningLine(used: 64, remaining: 3599), "남은 36% · 리셋까지 59분", "under an hour: the minutes left")
         expectEqual(UsageView.planningLine(used: 64, remaining: 600), "남은 36% · 리셋까지 10분", "ten minutes left")
         expectEqual(UsageView.planningLine(used: 64, remaining: 60), "남은 36% · 리셋까지 1분", "a minute left")
-        expectEqual(UsageView.planningLine(used: 64, remaining: 119.9), "남은 36% · 리셋까지 1분", "whole minutes, rounded down")
+        // Whole minutes counted like the reset line's `dur` (to the second,
+        // then down), so the two lines never disagree.
+        expectEqual(UsageView.planningLine(used: 64, remaining: 119.9), "남은 36% · 리셋까지 2분", "119.9 s reads 2분, as the reset line says")
+        expectEqual(UsageView.planningLine(used: 64, remaining: 119.4), "남은 36% · 리셋까지 1분", "119.4 s reads 1분")
+        expectEqual(UsageView.planningLine(used: 64, remaining: 599.7), "남은 36% · 리셋까지 10분", "599.7 s reads 10분")
+        expectEqual(UsageView.planningLine(used: 64, remaining: 3599.6), "남은 36% · 리셋까지 시간당 36%씩", "3599.6 s reads an hour, as the reset line says")
+        expectEqual(UsageView.planningLine(used: 64, remaining: 59.6), "남은 36% · 리셋까지 1분", "59.6 s reads a minute")
+        expect(UsageView.planningLine(used: 64, remaining: 59.4) == nil, "59.4 s is under a minute: no line")
+        expect(UsageView.planningLine(used: 64, remaining: 1e19) == nil, "an absurd time left plans nothing")
+        expect(UsageView.planningLine(used: 64, remaining: -.infinity) == nil, "nor a non-finite one")
         let lastHour = Snapshot(
             capturedAt: now.timeIntervalSince1970 - 60, fiveHour: nil,
             sevenDay: RLWindow(used_percentage: 64, resets_at: now.timeIntervalSince1970 + 570),
@@ -1354,6 +1363,24 @@ struct UsageProviderSelectionTestMain {
         )
         expect(texts(future.entries).contains("? 전 갱신 · Opus 5"), "footer of a far-future capture: \(texts(future.entries))")
 
+        // A clock set back since the capture: within the minute allowed for
+        // that the age reads as none, beyond it as unknown, never negative.
+        let t = now.timeIntervalSince1970
+        let justAhead = MenuComposition.compose(providerMode: .claude, claudeSnapshot: makeClaudeSnapshot(capturedAt: t + 30), now: now)
+        expect(texts(justAhead.entries).contains("0초 전 갱신 · Opus 5"), "footer of a capture 30 s ahead: \(texts(justAhead.entries))")
+        let monthAhead = MenuComposition.compose(
+            providerMode: .codex, claudeSnapshot: makeClaudeSnapshot(capturedAt: t + 30 * 86_400), now: now
+        )
+        expect(texts(monthAhead.entries).contains("? 전 갱신 · Opus 5"), "footer of a capture a month ahead: \(texts(monthAhead.entries))")
+        let attemptAhead = texts(FreshnessPresentation.entries(
+            snapshot: makeClaudeSnapshot(capturedAt: t - 3600),
+            poll: ClaudePollStatus(runningFor: nil, lastAttempt: Date(timeIntervalSince1970: t + 20)),
+            numbersShown: true, now: now
+        ))
+        expect(attemptAhead.contains("마지막 조회 시도 0초 전"), "an attempt 20 s ahead: \(attemptAhead)")
+        expect(!(texts(justAhead.entries) + texts(monthAhead.entries) + attemptAhead).contains { $0.contains("-") && $0.contains("초") },
+               "no negative age anywhere")
+
         expect(UsageView.planningLine(used: 1e19, remaining: 86_400) == nil, "an absurd percentage plans nothing")
     }
 
@@ -1533,7 +1560,14 @@ struct UsageProviderSelectionTestMain {
         let composition = MenuComposition.compose(providerMode: .claude, claudeSnapshot: snapshot, now: now)
         let lines = texts(composition.entries)
         expectEqual(barTexts(composition.entries).count, 2, "bars for the week and Opus only: \(lines)")
-        expect(!lines.contains { $0.hasPrefix("5시간") }, "no 5-hour section")
+        // The 5-hour section says why it has no number instead of going missing.
+        let reason = "사용률 값 없음 — 마지막 조회에 5시간 줄이 없음 (창은 \(clockText(fiveReset))까지)"
+        if let header = composition.entries.firstIndex(of: .header("5시간")) {
+            expectEqual(composition.entries[header + 1], .line(reason), "the 5-hour section gives the reason: \(lines)")
+        } else {
+            expect(false, "a 5-hour section with the reason: \(lines)")
+        }
+        expect(!lines.contains("5시간 · 링"), "not marked as the ring")
         expect(!lines.contains { $0.contains("Fable") }, "no Fable section")
         let endedWords = ["창 끝남", "리셋됨", "지금 열린 창 없음", "다음 메시지부터"]
         expect(!lines.contains { line in endedWords.contains { line.contains($0) } }, "no ended text while the resets are ahead")
@@ -1553,6 +1587,41 @@ struct UsageProviderSelectionTestMain {
         let later = texts(UsageView(snapshot: snapshot, now: Date(timeIntervalSince1970: fiveReset + 60)).entries)
         expect(later.contains("\(clockText(fiveReset))에 창 끝남 · 새 값은 다음 조회 때"), "past its reset: the 5-hour window ended: \(later)")
         expect(!later.contains { $0.contains("Fable") }, "Fable's reset is still ahead: nothing yet")
+
+        // A session line the latest poll printed but could not read: no
+        // number either, and its own reason, with or without a reset.
+        for reset in ["null", "\(fiveReset)"] {
+            let unread = try decodeSnapshot("""
+            {"capturedAt": \(t - 60), "fiveHour": {"used_percentage": null, "resets_at": \(reset)}, \
+            "fiveHourSeenAt": \(t - 60), \
+            "sevenDay": {"used_percentage": 60, "resets_at": \(weekReset)}, "source": "usage-poll"}
+            """)
+            expect(unread.latestPollPrintedSessionLine, "the latest poll printed the line (reset \(reset))")
+            let entries = UsageView(snapshot: unread, now: now).entries
+            if let header = entries.firstIndex(of: .header("5시간")) {
+                expectEqual(entries[header + 1], .line("사용률 값 없음 — 5시간 줄을 해석하지 못함"), "unreadable line, reset \(reset)")
+            } else {
+                expect(false, "a 5-hour section for an unreadable line (reset \(reset)): \(texts(entries))")
+            }
+            expectEqual(barTexts(entries).count, 1, "only the week's bar (reset \(reset))")
+        }
+        // A readable line's window is drawn as usual, and statusLine output
+        // (which never clears a window) says nothing it cannot know.
+        let readable = try decodeSnapshot("""
+        {"capturedAt": \(t - 60), "fiveHour": {"used_percentage": 30, "resets_at": \(fiveReset)}, \
+        "fiveHourSeenAt": \(t - 60), "sevenDay": {"used_percentage": 60, "resets_at": \(weekReset)}, "source": "usage-poll"}
+        """)
+        expect(!texts(UsageView(snapshot: readable, now: now).entries).contains { $0.hasPrefix("사용률 값 없음") }, "a readable line has its bar")
+        let statusLine = try decodeSnapshot("""
+        {"capturedAt": \(t - 60), "fiveHour": {"used_percentage": null, "resets_at": \(fiveReset)}, \
+        "sevenDay": {"used_percentage": 60, "resets_at": \(weekReset)}}
+        """)
+        expect(!texts(UsageView(snapshot: statusLine, now: now).entries).contains("5시간"), "statusLine output: no 5-hour section")
+        let absent = try decodeSnapshot("""
+        {"capturedAt": \(t - 60), "fiveHour": null, "fiveHourAbsentSince": \(t - 600), "fiveHourSeenAt": \(t - 9000), \
+        "sevenDay": {"used_percentage": 60, "resets_at": \(weekReset)}, "source": "usage-poll"}
+        """)
+        expect(!texts(UsageView(snapshot: absent, now: now).entries).contains("5시간"), "no 5-hour limit: no 5-hour section")
 
         // Every window blanked: nothing to draw.
         let allBlank = try decodeSnapshot("""

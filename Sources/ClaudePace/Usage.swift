@@ -106,6 +106,7 @@ struct UsageView {
         // An account without a 5-hour limit has no 5-hour window to end either.
         let fiveEnded = snapshot.hasNoFiveHourLimit
             ? nil : endedLine(snapshot.reading(snapshot.fiveHour, at: now), fiveHour: true)
+                ?? fiveHourWithoutNumberLine(snapshot)
         if let w = week {
             e.append(.header(title("주간 전체 (7일)", .week)))
             appendWeekly(w, resetLine: true, to: &e)
@@ -198,8 +199,10 @@ struct UsageView {
                 // after. It has ended since that output, as above.
                 appendEnded(name, endedAt: endedAt, to: &e)
             case .noOpenWindow, .unavailable:
-                // A poll well after its reset left the bucket as it was, so
-                // `/usage` no longer prints it (a renamed or retired model).
+                // A poll well after its reset left the bucket as it was, or
+                // one that printed the all-models line left it out and the
+                // collector cleared its percentage: `/usage` no longer
+                // prints it (a renamed or retired model).
                 continue
             }
         }
@@ -236,6 +239,21 @@ struct UsageView {
         return base + " · 링"
     }
 
+    /// Why the latest poll left the 5-hour window without a number, when it
+    /// did: it printed a session line it could not read, or none although the
+    /// stored window's reset is still ahead (the collector then clears the
+    /// percentage and keeps the reset). The section says so instead of just
+    /// going missing, and is drawn without a bar.
+    private func fiveHourWithoutNumberLine(_ snapshot: Snapshot) -> String? {
+        guard snapshot.source == "usage-poll" else { return nil }
+        if snapshot.latestPollPrintedSessionLine {
+            return "사용률 값 없음 — 5시간 줄을 해석하지 못함"
+        }
+        guard let window = snapshot.fiveHour, window.used_percentage == nil,
+              let reset = window.resets_at, reset.isFinite, reset > now.timeIntervalSince1970 else { return nil }
+        return "사용률 값 없음 — 마지막 조회에 5시간 줄이 없음 (창은 \(clock(Date(timeIntervalSince1970: reset)))까지)"
+    }
+
     private func noFiveHourLimitLine(since: Double?) -> String {
         var line = "5시간 한도 없는 계정 · 주간 한도만 적용"
         if let since, since.isFinite, since > 0 {
@@ -266,23 +284,25 @@ struct UsageView {
     /// What is left of a weekly window and the even rate that lands exactly
     /// on 100% at the reset: per day with a day or more to go, per hour in
     /// the last day. In the last hour a per-hour rate would exceed what is
-    /// left, so the line gives the time to the reset instead (whole minutes).
-    /// Plain arithmetic on the official values; nil once there is nothing to
-    /// plan (used up, or under a minute to the reset).
+    /// left, so the line gives the time to the reset instead, in whole
+    /// minutes counted like the reset line above it (`dur`), so the two
+    /// never disagree. Plain arithmetic on the official values; nil once
+    /// there is nothing to plan (used up, or under a minute to the reset).
     static func planningLine(used: Double, remaining: TimeInterval) -> String? {
-        guard used.isFinite, (0...100).contains(used), remaining.isFinite, remaining >= 60 else { return nil }
+        guard used.isFinite, (0...100).contains(used), remaining.isFinite, remaining < 1e12 else { return nil }
+        let seconds = Int(remaining.rounded())
+        guard seconds >= 60 else { return nil }
         let shown = Int(used.rounded())
         // The bar already says "사용 100%" from 99.5 up: nothing left to plan.
         guard shown < 100 else { return nil }
         let left = "남은 \(100 - shown)%"
-        let hour: TimeInterval = 3600
+        let hour = 3600
         let day = 24 * hour
-        guard remaining >= hour else {
-            // Rounded down: never more time than there is.
-            return "\(left) · 리셋까지 \(max(Int(remaining / 60), 1))분"
+        guard seconds >= hour else {
+            return "\(left) · 리셋까지 \(seconds / 60)분"
         }
-        let perDay = remaining >= day
-        let rate = (100 - used) / (remaining / (perDay ? day : hour))
+        let perDay = seconds >= day
+        let rate = (100 - used) / (remaining / Double(perDay ? day : hour))
         return "\(left) · 리셋까지 \(perDay ? "하루" : "시간당") \(rateText(rate))"
     }
 }
@@ -381,9 +401,12 @@ private func rateText(_ rate: Double) -> String {
 
 /// A span as the menu says it ("1일 4시간"). Nothing real here comes near a
 /// century, so one that does (a capture time far off) reads "?" rather than
-/// trapping on its way to Int.
+/// trapping on its way to Int. An age below zero means the clock was set
+/// back since that instant: within the minute the menu allows for that it
+/// reads as none, beyond it as "?", never as "-29초".
 private func dur(_ s: TimeInterval) -> String {
     guard s.isFinite, abs(s) < 100 * 365 * 24 * 3600 else { return "?" }
+    if s < 0 { return s >= -60 ? "0초" : "?" }
     let t = Int(s.rounded())
     if t < 60 { return "\(t)초" }
     let m = t / 60

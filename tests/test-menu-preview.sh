@@ -360,8 +360,9 @@ dump "absurd codex windows" "$mark"
 rm -f "$app/codex-snapshot.json"
 
 # --- 13) windows the latest poll did not print (percentage blanked, reset kept,
-# fiveHourSeenAt added): no reading, so no section, no ended text, and a
-# pinned week falls back while staying listed, greyed out
+# fiveHourSeenAt added): no reading, so no bar and no ended text. The 5-hour
+# section says why it has no number instead of going missing; a pinned week
+# falls back while staying listed, greyed out
 cat > "$app/snapshot.json" <<JSON
 {"capturedAt": $captured, "fiveHour": {"used_percentage": null, "resets_at": $five_reset},
  "fiveHourSeenAt": $((captured - 3600)),
@@ -373,12 +374,14 @@ printf '{"schema":"claudepace-settings.v1","ring":"week"}\n' > "$app/settings.js
 mark=$failures
 preview claude
 check_run "blanked windows"
-[ "$(sed -n 2p "$out")" = "Fable 주간 · 링" ] || fail "blanked windows: the Fable section is not right under the header"
+[ "$(sed -n 2p "$out")" = "5시간" ] || fail "blanked windows: the 5-hour section is not right under the header"
+line "blanked windows" "사용률 값 없음 — 마지막 조회에 5시간 줄이 없음 (창은 $(clock "$five_reset")까지)"
+above "blanked windows" "사용률 값 없음" "Fable 주간 · 링"
 line "blanked windows" "링: 주간 전체 지금 값 없음 · 자동으로 표시"
 line "blanked windows" "ring: Fable 주간 91%"
 line "blanked windows" "메뉴바 링 ▸ 자동 (가장 많이 쓴 한도) | Fable 주간 | ✓주간 전체 (지금 값 없음)"
 no_line "blanked windows" "주간 전체 (7일)"
-no_line "blanked windows" "5시간"
+absent "blanked windows" "5시간 · 링"
 absent "blanked windows" "창 끝남"
 absent "blanked windows" "리셋됨"
 absent "blanked windows" "지금 열린 창 없음"
@@ -386,6 +389,24 @@ absent "blanked windows" "지금 열린 창 없음"
 tidy "blanked windows"
 rm -f "$app/settings.json"
 dump "blanked windows" "$mark"
+
+# ...and one the latest poll printed but could not read
+cat > "$app/snapshot.json" <<JSON
+{"capturedAt": $captured, "fiveHour": {"used_percentage": null, "resets_at": null},
+ "fiveHourSeenAt": $captured,
+ "sevenDay": {"used_percentage": 40, "resets_at": $week_reset}, "sevenDayOpus": null, "sevenDaySonnet": null,
+ "source": "usage-poll"}
+JSON
+mark=$failures
+preview claude
+check_run "unreadable session line"
+line "unreadable session line" "5시간"
+line "unreadable session line" "사용률 값 없음 — 5시간 줄을 해석하지 못함"
+above "unreadable session line" "주간 전체 (7일)" "5시간"
+line "unreadable session line" "ring: 주간 전체 40%"
+[ "$(grep -c '^\[' "$out")" -eq 1 ] || fail "unreadable session line: a bar other than the week's"
+tidy "unreadable session line"
+dump "unreadable session line" "$mark"
 
 # --- 14) the last hour of a week: the time left instead of a per-hour rate
 # larger than what is left (a fresh now: the reset is minutes away)
