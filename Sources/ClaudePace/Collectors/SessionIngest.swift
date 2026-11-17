@@ -106,9 +106,10 @@ enum SessionIngest {
             if offset > size { offset = 0 }
             if offset == size { continue }
 
-            func ingest(_ line: Data) {
+            func ingest(_ line: Data, salvaging: Bool) {
                 guard line.range(of: settings.needle) != nil,
-                      let value = try? JSONParser.parse(line) else { return }
+                      let value = (try? JSONParser.parse(line))
+                        ?? (salvaging ? gluedObject(in: line, needle: settings.needle) : nil) else { return }
                 let event: (id: String, record: JSONObject)?
                 switch source {
                 case .codex: event = codexEvent(value, file: file)
@@ -124,11 +125,14 @@ enum SessionIngest {
             // file ended inside a line the CLI was still writing; the rest
             // of that line was then read on its own next time, and the event
             // was lost. A last line that is not complete JSON yet is now left
-            // to be read again, whole, on the next run.
+            // to be read again, whole, on the next run. Only lines that end
+            // in a newline are searched for a line glued onto a broken one:
+            // a last line may still be growing, and the end of a half-written
+            // line can already be a complete (inner) object.
             var nextOffset = size
-            if let tail = readLines(of: file, from: offset, ingest) {
+            if let tail = readLines(of: file, from: offset, { ingest($0, salvaging: true) }) {
                 if (try? JSONParser.parse(tail.fragment)) != nil {
-                    ingest(tail.fragment)
+                    ingest(tail.fragment, salvaging: false)
                 } else {
                     nextOffset = min(size, tail.position)
                 }
@@ -176,6 +180,58 @@ enum SessionIngest {
             pending = Data(pending[start...])
         }
         return pending.isEmpty ? nil : (pending, position)
+    }
+
+    /// A complete line glued onto a broken one. A writer that dies in the
+    /// middle of a line never writes its newline, so the next line put in
+    /// the same file (say by `claude --resume`, which keeps appending to the
+    /// session file) runs on from the broken half, and the two fail to parse
+    /// as one line. Returns the first suffix, from the left and never the
+    /// whole line, that starts with `{"` and parses as one complete object,
+    /// if it holds the needle itself, as any line that gets parsed must.
+    ///
+    /// At most one suffix parses that way, and it starts at the `{` that the
+    /// line's last `}` closes. (Inside valid JSON a `"` delimits a string
+    /// exactly when an even number of backslashes come right before it, so
+    /// which quotes delimit strings, and so which brackets count, does not
+    /// depend on where reading started.) One pass from the right finds that
+    /// brace and the suffix is parsed once: however long the line (Claude
+    /// lines can be megabytes) and however many objects its broken half
+    /// holds, salvage costs at most about two more reads of it.
+    private static func gluedObject(in line: Data, needle: Data) -> JSONValue? {
+        let quote = UInt8(ascii: "\"")
+        let start = line.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) -> Int? in
+            var index = bytes.count - 1
+            while index > 0, [0x20, 0x09, 0x0A, 0x0D].contains(bytes[index]) { index -= 1 }
+            guard index > 0, bytes[index] == UInt8(ascii: "}") else { return nil }
+            var depth = 0
+            var inString = false
+            while index > 0 {
+                let byte = bytes[index]
+                if byte == quote {
+                    var before = index - 1
+                    while before >= 0, bytes[before] == UInt8(ascii: "\\") { before -= 1 }
+                    if (index - 1 - before) % 2 == 0 { inString.toggle() }
+                } else if !inString {
+                    if byte == UInt8(ascii: "}") || byte == UInt8(ascii: "]") {
+                        depth += 1
+                    } else if byte == UInt8(ascii: "{") || byte == UInt8(ascii: "[") {
+                        depth -= 1
+                        if depth == 0 {
+                            return byte == UInt8(ascii: "{") && bytes[index + 1] == quote ? index : nil
+                        }
+                    }
+                }
+                index -= 1
+            }
+            return nil
+        }
+        guard let start else { return nil }
+        let suffix = line[(line.startIndex + start)...]
+        guard suffix.range(of: needle) != nil,
+              let value = try? JSONParser.parse(suffix),
+              case .object = value else { return nil }
+        return value
     }
 
     /// `$(jq -r 'path // empty')`: jq's raw text of the value, or "".
