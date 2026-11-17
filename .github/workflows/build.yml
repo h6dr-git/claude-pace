@@ -29,6 +29,12 @@ jobs:
       - name: provider selection tests
         run: .github/scripts/run-step.sh "provider selection tests" bash tests/test-usage-provider-selection.sh
 
+      - name: reset time tests
+        run: .github/scripts/run-step.sh "reset time tests" bash tests/test-reset-time.sh
+
+      - name: menu preview tests
+        run: .github/scripts/run-step.sh "menu preview tests" bash tests/test-menu-preview.sh
+
       - name: claude usage poll tests
         run: .github/scripts/run-step.sh "claude usage poll tests" bash tests/test-claude-usage-poll.sh
 
