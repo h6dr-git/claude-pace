@@ -42,6 +42,11 @@ struct UsageProviderSelectionTestMain {
         try testPreviewText()
         testOutOfRangeResetsAreNoReading()
         testAbsurdTimesNeverTrap()
+        testBucketEndingAsThePollReturns()
+        testEndedWeekKeepsItsHeader()
+        try testNoStraySeparators()
+        try testBlankedWindowsAreNoReading()
+        try testCodexRowsOnlyInCodexMode()
 
         guard failures == 0 else {
             fputs("FAIL: \(failures) usage-provider assertions failed\n", stderr)
@@ -736,6 +741,15 @@ struct UsageProviderSelectionTestMain {
             )
             expectEqual(composition.ring?.window, .model("Fable"), "\(name): the menu bar draws Fable")
             expectEqual(composition.ring?.used, 91, "\(name): the menu bar draws 91%")
+            // The pace tick: how far into Fable's week we are, counted back
+            // from its reset (1794978000), about 83%.
+            let fableStart = 1_794_978_000 - WindowCalc.weekLength
+            let fablePace = (realNow.timeIntervalSince1970 - fableStart) / WindowCalc.weekLength
+            expect(
+                abs((composition.ring?.pace ?? -1) - fablePace) < 1e-9,
+                "\(name): the ring's pace tick is Fable's elapsed week (\(fablePace)): \(String(describing: composition.ring?.pace))"
+            )
+            expect(abs(fablePace - 0.831) < 0.001, "\(name): about 83% of that week has gone (\(fablePace))")
             expect(composition.ring?.dimmed == false, "\(name): a two-minute-old reading is not dimmed")
             expect(composition.toolTip.hasPrefix("AI Usage · Claude · 링 Fable 주간 91% · 주 60%"), "\(name): tooltip names the ring: \(composition.toolTip)")
             expect(texts(composition.entries).contains("Fable 주간 · 링"), "\(name): the Fable section is marked")
@@ -884,6 +898,20 @@ struct UsageProviderSelectionTestMain {
         expect(UsageView.planningLine(used: 99.6, remaining: 2 * day) == nil, "shown as 100%: no line")
         expect(UsageView.planningLine(used: 40, remaining: 0) == nil, "no time left: no line")
         expect(UsageView.planningLine(used: 40, remaining: 30) == nil, "under a minute left: no line")
+        // In the last hour a per-hour rate would exceed what is left (36%
+        // left with 10 minutes to go is "216% an hour"): the time instead.
+        expectEqual(UsageView.planningLine(used: 64, remaining: hour), "남은 36% · 리셋까지 시간당 36%씩", "an hour left is still per hour")
+        expectEqual(UsageView.planningLine(used: 64, remaining: 3599), "남은 36% · 리셋까지 59분", "under an hour: the minutes left")
+        expectEqual(UsageView.planningLine(used: 64, remaining: 600), "남은 36% · 리셋까지 10분", "ten minutes left")
+        expectEqual(UsageView.planningLine(used: 64, remaining: 60), "남은 36% · 리셋까지 1분", "a minute left")
+        expectEqual(UsageView.planningLine(used: 64, remaining: 119.9), "남은 36% · 리셋까지 1분", "whole minutes, rounded down")
+        let lastHour = Snapshot(
+            capturedAt: now.timeIntervalSince1970 - 60, fiveHour: nil,
+            sevenDay: RLWindow(used_percentage: 64, resets_at: now.timeIntervalSince1970 + 570),
+            sevenDayOpus: nil, sevenDaySonnet: nil, modelWindows: nil, model: nil, source: "usage-poll"
+        )
+        let lastHourSection = section("주간 전체 (7일)", in: UsageView(snapshot: lastHour, now: now).entries) ?? []
+        expectEqual(texts(lastHourSection).last, "남은 36% · 리셋까지 9분", "the weekly section says so in its last hour")
 
         let weekly = UsageView(snapshot: try? absentSnapshot(), now: realNow).entries
         let weekSection = section("주간 전체 (7일)", in: weekly) ?? []
@@ -1010,6 +1038,41 @@ struct UsageProviderSelectionTestMain {
         let composition = MenuComposition.compose(providerMode: .claude, claudeSnapshot: absent, now: realNow)
         expect(barTexts(composition.entries).count == 2, "only the weekly and Fable bars")
 
+        // The note comes once, after the limits that do apply: below the
+        // last bucket's last line, not between the week and the buckets.
+        let t = now.timeIntervalSince1970
+        let twoBuckets = Snapshot(
+            capturedAt: t - 60, fiveHour: nil,
+            sevenDay: RLWindow(used_percentage: 60, resets_at: t + 2 * 86_400),
+            sevenDayOpus: nil, sevenDaySonnet: nil,
+            modelWindows: [
+                "Fable": RLWindow(used_percentage: 91, resets_at: t + 2 * 86_400),
+                "Zeta": RLWindow(used_percentage: 12, resets_at: t + 3 * 86_400)
+            ],
+            model: nil, fiveHourAbsentSince: absentSince, source: "usage-poll"
+        )
+        let noteLine = MenuEntry.line("5시간 한도 없는 계정 · 주간 한도만 적용 (\(dayText(absentSince)) 확인)")
+        for (name, entries) in [
+            ("real snapshot", composition.entries),
+            ("two buckets", MenuComposition.compose(providerMode: .claude, claudeSnapshot: twoBuckets, now: now).entries),
+            ("secondary block", MenuComposition.compose(providerMode: .codex, claudeSnapshot: twoBuckets, now: now).entries)
+        ] {
+            let lastBucketHeader = entries.lastIndex { entry in
+                if case .header(let text) = entry { return text.hasPrefix("Fable 주간") || text.hasPrefix("Zeta 주간") }
+                return false
+            }
+            guard let lastBucketHeader, let note = entries.firstIndex(of: noteLine) else {
+                expect(false, "\(name): no bucket or no note: \(texts(entries))")
+                continue
+            }
+            // That bucket's rows run up to the next separator.
+            let lastBucketRow = (entries[lastBucketHeader...].firstIndex(of: .separator) ?? entries.endIndex) - 1
+            expect(texts([entries[lastBucketRow]]).first?.hasPrefix("남은 ") == true, "\(name): the bucket ends with its planning line")
+            expect(note > lastBucketRow, "\(name): the note comes after the last bucket line: \(texts(entries))")
+            expectEqual(entries[note - 1], .separator, "\(name): set off by a separator")
+            expectEqual(entries.filter { $0 == noteLine }.count, 1, "\(name): said once")
+        }
+
         // Without the key, today's 5-hour handling stays exactly as it was.
         let today = try decodeSnapshot(realSnapshotJSON)
         let todayLines = texts(UsageView(snapshot: today, now: realNow).entries)
@@ -1017,7 +1080,6 @@ struct UsageProviderSelectionTestMain {
             todayLines.contains("지금 열린 창 없음 (\(clockText(1_794_637_200))에 끝남) · 다음 메시지부터 새로 시작"),
             "no key: the ended window still reads as before"
         )
-        let t = now.timeIntervalSince1970
         let pro = Snapshot(
             capturedAt: t, fiveHour: RLWindow(used_percentage: 22, resets_at: t + 7200),
             sevenDay: RLWindow(used_percentage: 5, resets_at: t + 3 * 86_400),
@@ -1050,11 +1112,18 @@ struct UsageProviderSelectionTestMain {
         let pinnedGone = RingChoice.options(for: .pinned(.model("Opus")), in: nil, at: realNow)
         expectEqual(
             pinnedGone.map(\.title),
-            ["자동 (가장 많이 쓴 한도)", "주간 전체", "Opus 주간 (지금 값 없음)"],
+            ["자동 (가장 많이 쓴 한도)", "Opus 주간 (지금 값 없음)"],
             "with no reading shown the pinned bucket is still listed"
         )
+        // The all-models week is listed like the others: only with a reading.
         let pinnedWeek = RingChoice.options(for: .pinned(.week), in: nil, at: realNow)
-        expectEqual(pinnedWeek.map(\.isSelected), [false, true], "a pinned week is always listed, never twice")
+        expectEqual(pinnedWeek.map(\.title), ["자동 (가장 많이 쓴 한도)", "주간 전체 (지금 값 없음)"], "a pinned week without a reading is listed once")
+        expectEqual(pinnedWeek.map(\.isSelected), [false, true], "checked")
+        expectEqual(pinnedWeek.map(\.isEnabled), [true, false], "and greyed out")
+        expectEqual(pinnedWeek.last?.setting, .pinned(.week), "carrying the pinned setting")
+        let pinnedWeekShown = RingChoice.options(for: .pinned(.week), in: absent, at: realNow)
+        expectEqual(pinnedWeekShown.map(\.title), ["자동 (가장 많이 쓴 한도)", "주간 전체", "Fable 주간"], "a pinned week with a reading is listed once, enabled")
+        expectEqual(pinnedWeekShown.map(\.isSelected), [false, true, false], "with the checkmark")
 
         let t = now.timeIntervalSince1970
         let pro = Snapshot(
@@ -1065,16 +1134,29 @@ struct UsageProviderSelectionTestMain {
         let proOptions = RingChoice.options(for: .pinned(.five), in: pro, at: now)
         expectEqual(proOptions.map(\.title), ["자동 (가장 많이 쓴 한도)", "주간 전체", "5시간"], "a 5-hour reading lists 5시간")
         expectEqual(proOptions.map(\.isSelected), [false, false, true], "checkmark on the pinned window")
-        expectEqual(RingChoice.options(for: .auto, in: nil, at: now).map(\.title), ["자동 (가장 많이 쓴 한도)", "주간 전체"], "no snapshot: auto and weekly")
+        expectEqual(RingChoice.options(for: .auto, in: nil, at: now).map(\.title), ["자동 (가장 많이 쓴 한도)"], "no snapshot: auto only")
+
+        // A week that ended is no reading either: not offered, like an ended 5-hour window.
+        let weekEnded = Snapshot(
+            capturedAt: t - 3600, fiveHour: RLWindow(used_percentage: 22, resets_at: t + 7200),
+            sevenDay: RLWindow(used_percentage: 60, resets_at: t - 60),
+            sevenDayOpus: nil, sevenDaySonnet: nil, modelWindows: nil, model: nil, source: "usage-poll"
+        )
+        expectEqual(RingChoice.options(for: .auto, in: weekEnded, at: now).map(\.title), ["자동 (가장 많이 쓴 한도)", "5시간"], "an ended week is not offered")
+        let weekEndedPinned = RingChoice.options(for: .pinned(.week), in: weekEnded, at: now)
+        expectEqual(weekEndedPinned.map(\.title), ["자동 (가장 많이 쓴 한도)", "5시간", "주간 전체 (지금 값 없음)"], "a pinned ended week stays listed, last")
+        expectEqual(weekEndedPinned.map(\.isEnabled), [true, true, false], "greyed out")
 
         // A reading too old to show offers none of its windows.
         let dayOld = MenuComposition.compose(
             providerMode: .claude, claudeSnapshot: absent, now: realNow.addingTimeInterval(25 * 3600)
         )
-        expectEqual(dayOld.ringOptions.map(\.title), ["자동 (가장 많이 쓴 한도)", "주간 전체"], "a hidden reading lists no windows")
+        expectEqual(dayOld.ringOptions.map(\.title), ["자동 (가장 많이 쓴 한도)"], "a hidden reading lists no windows")
 
         let composition = MenuComposition.compose(providerMode: .claude, claudeSnapshot: pro, now: now)
         expectEqual(composition.ring?.window, .five, "Pro: auto picks the fuller 5-hour window")
+        // The pace tick: the elapsed fraction of the 5-hour window, 3 of 5 hours.
+        expectEqual(composition.ring?.pace, 0.6, "Pro: the ring's pace tick is where the 5-hour window stands")
         expect(texts(composition.entries).contains("5시간 · 링"), "Pro: the 5-hour section is marked")
         expectEqual(composition.toolTip, "AI Usage · Claude · 링 5시간 22% · 주 5%", "Pro tooltip")
         expectEqual(composition.ringOptions, RingChoice.options(for: .auto, in: pro, at: now), "the composition carries the submenu")
@@ -1117,7 +1199,7 @@ struct UsageProviderSelectionTestMain {
         expectEqual(missing.image, .unavailable(accessibilityDescription: "Claude 사용량 확인 불가"), "no snapshot: ?")
         expectEqual(missing.toolTip, ClaudeUsageUnavailablePresentation.toolTip, "no snapshot: tooltip")
         expect(texts(missing.entries).contains("스냅샷 없음 · 아직 한 번도 수집되지 않음"), "no snapshot: says so")
-        expectEqual(missing.ringOptions.map(\.title), ["자동 (가장 많이 쓴 한도)", "주간 전체"], "Claude mode keeps the submenu")
+        expectEqual(missing.ringOptions.map(\.title), ["자동 (가장 많이 쓴 한도)"], "Claude mode keeps the submenu")
 
         let history = MenuComposition.compose(
             providerMode: .claude, claudeSnapshot: nil,
@@ -1246,6 +1328,247 @@ struct UsageProviderSelectionTestMain {
         expect(texts(future.entries).contains("? 전 갱신 · Opus 5"), "footer of a far-future capture: \(texts(future.entries))")
 
         expect(UsageView.planningLine(used: 1e19, remaining: 86_400) == nil, "an absurd percentage plans nothing")
+    }
+
+    /// `/usage` prints a bucket as it stands when it runs; the capture time is
+    /// stamped once the poll returns. A bucket printed at 13:59:50 with a
+    /// 14:00 reset and captured at 14:00:20 ended since that output: it is
+    /// shown as ended, not hidden like a bucket `/usage` stopped printing.
+    private static func testBucketEndingAsThePollReturns() {
+        let reset = now.timeIntervalSince1970 - 300
+        func snapshot(capturedAfterReset delay: Double) -> Snapshot {
+            Snapshot(
+                capturedAt: reset + delay, fiveHour: nil,
+                sevenDay: RLWindow(used_percentage: 60, resets_at: reset + 3 * 86_400),
+                sevenDayOpus: nil, sevenDaySonnet: nil,
+                modelWindows: ["Fable": RLWindow(used_percentage: 91, resets_at: reset)],
+                model: nil, source: "usage-poll"
+            )
+        }
+        let ended = MenuEntry.line("\(clockText(reset))에 리셋됨 · 새 값은 다음 조회 때")
+        let justAfter = snapshot(capturedAfterReset: 20)
+        expectEqual(
+            justAfter.reading(justAfter.modelWindows?["Fable"], at: now), .noOpenWindow(endedAt: reset),
+            "Snapshot.reading itself is left as it was"
+        )
+        let shown = UsageView(snapshot: justAfter, now: now).entries
+        expectEqual(section("Fable 주간", in: shown) ?? [], [ended], "captured 20s after the reset: shown as ended")
+        expect(!barTexts(shown).contains { $0.hasPrefix("사용 91%") }, "with no percentage")
+        expectEqual(
+            section("Fable 주간", in: UsageView(snapshot: justAfter, polled: false, now: now).entries) ?? [],
+            [.line("\(clockText(reset))에 리셋됨 · 이 모드에선 새로 조회하지 않음")],
+            "under another provider too"
+        )
+        expectEqual(
+            section("Fable 주간", in: UsageView(snapshot: snapshot(capturedAfterReset: 119), now: now).entries) ?? [],
+            [ended], "119s after: still that output"
+        )
+        for delay in [120.0, 200] {
+            let hidden = UsageView(snapshot: snapshot(capturedAfterReset: delay), now: now).entries
+            expect(
+                !texts(hidden).contains { $0.contains("Fable") },
+                "captured \(Int(delay))s after the reset: a bucket /usage stopped printing is hidden"
+            )
+        }
+        let composition = MenuComposition.compose(providerMode: .claude, claudeSnapshot: justAfter, now: now)
+        expectEqual(composition.ring?.window, .week, "an ended bucket never drives the ring")
+        expect(!composition.ringOptions.contains { $0.title.contains("Fable") }, "nor is offered to pin")
+    }
+
+    /// An ended all-models week keeps the section's full name ("주간 전체
+    /// (7일)", formerly "주간 (7일)"), with no percentage and no ring mark.
+    private static func testEndedWeekKeepsItsHeader() {
+        let t = now.timeIntervalSince1970
+        func snapshot(capturedAt: Double) -> Snapshot {
+            Snapshot(
+                capturedAt: capturedAt, fiveHour: RLWindow(used_percentage: 22, resets_at: t + 7200),
+                sevenDay: RLWindow(used_percentage: 60, resets_at: t - 60),
+                sevenDayOpus: nil, sevenDaySonnet: nil, modelWindows: nil, model: nil, source: "usage-poll"
+            )
+        }
+        let ended = "\(clockText(t - 60))에 리셋됨"
+        // Reset after the last poll, or polled after the reset with no new
+        // week printed yet: the same words either way.
+        for (name, capturedAt) in [("ended since the poll", t - 3600), ("polled after the reset", t - 30)] {
+            let composition = MenuComposition.compose(
+                providerMode: .claude, claudeSnapshot: snapshot(capturedAt: capturedAt), now: now
+            )
+            expectEqual(
+                section("주간 전체 (7일)", in: composition.entries) ?? [], [.line("\(ended) · 새 값은 다음 조회 때")],
+                "\(name): the ended week keeps the 주간 전체 (7일) header"
+            )
+            expect(!texts(composition.entries).contains("주간 전체 (7일) · 링"), "\(name): an ended week is not the ring")
+            expect(!texts(composition.entries).contains { $0.hasPrefix("주간 (7일)") }, "\(name): the old name is gone")
+            expectEqual(composition.ring?.window, .five, "\(name): the ring draws the 5-hour window")
+        }
+        let secondary = UsageView(snapshot: snapshot(capturedAt: t - 3600), polled: false, now: now).entries
+        expectEqual(
+            section("주간 전체 (7일)", in: secondary) ?? [], [.line("\(ended) · 이 모드에선 새로 조회하지 않음")],
+            "under another provider the same header"
+        )
+    }
+
+    /// Indices of separators that divide nothing: first, right under a
+    /// header, or right after another separator.
+    private static func straySeparators(_ entries: [MenuEntry]) -> [Int] {
+        entries.indices.filter { i in
+            guard entries[i] == .separator else { return false }
+            guard i > 0 else { return true }
+            if case .header = entries[i - 1] { return true }
+            return entries[i - 1] == .separator
+        }
+    }
+
+    /// A section that is left out leaves no divider behind: none right under
+    /// the "Claude" header, none twice in a row (the freshness block above
+    /// ends with its own).
+    private static func testNoStraySeparators() throws {
+        let t = now.timeIntervalSince1970
+        func fiveOnly(capturedAt: Double) -> Snapshot {
+            Snapshot(
+                capturedAt: capturedAt, fiveHour: RLWindow(used_percentage: 22, resets_at: t + 7200),
+                sevenDay: nil, sevenDayOpus: nil, sevenDaySonnet: nil, modelWindows: nil, model: nil,
+                source: "usage-poll"
+            )
+        }
+        let bucketOnly = Snapshot(
+            capturedAt: t - 60, fiveHour: nil, sevenDay: nil, sevenDayOpus: nil, sevenDaySonnet: nil,
+            modelWindows: ["Fable": RLWindow(used_percentage: 91, resets_at: t + 86_400)],
+            model: nil, fiveHourAbsentSince: t - 86_400, source: "usage-poll"
+        )
+        for (name, snapshot, first) in [
+            ("no weekly section", fiveOnly(capturedAt: t - 60), MenuEntry.header("5시간 · 링")),
+            ("only a bucket", bucketOnly, MenuEntry.header("Fable 주간 · 링"))
+        ] {
+            let entries = MenuComposition.compose(providerMode: .claude, claudeSnapshot: snapshot, now: now).entries
+            expectEqual(Array(entries.prefix(2)), [.header("Claude"), first], "\(name): the first section right under the header")
+            expectEqual(straySeparators(entries), [], "\(name): no stray separator: \(entries)")
+        }
+
+        // The stale block above: one separator between it and the numbers.
+        let stale = MenuComposition.compose(providerMode: .claude, claudeSnapshot: fiveOnly(capturedAt: t - 1800), now: now).entries
+        expectEqual(Array(stale.prefix(2)), [.header("Claude"), .header("⚠ 갱신 멈춤")], "stale: the freshness block first")
+        expectEqual(straySeparators(stale), [], "stale: no stray separator: \(stale)")
+        if let divider = stale.firstIndex(of: .separator), divider + 1 < stale.count {
+            expectEqual(stale[divider + 1], .header("5시간 · 링"), "stale: then straight to the 5-hour section")
+        } else {
+            expect(false, "stale: no separator under the freshness block: \(stale)")
+        }
+
+        // Under another provider: the secondary block's header, then the numbers.
+        let secondary = MenuComposition.compose(providerMode: .codex, claudeSnapshot: fiveOnly(capturedAt: t - 60), now: now).entries
+        expectEqual(straySeparators(secondary), [], "secondary block: no stray separator: \(secondary)")
+        if let header = secondary.firstIndex(of: .header("Claude · 전환 보조")), header + 1 < secondary.count {
+            expectEqual(secondary[header + 1], .header("5시간"), "secondary block: the 5-hour section right under its header")
+        } else {
+            expect(false, "secondary block missing: \(secondary)")
+        }
+
+        // Nothing but the note left: it opens the block.
+        let noteOnly = Snapshot(
+            capturedAt: t - 60, fiveHour: nil, sevenDay: nil, sevenDayOpus: nil, sevenDaySonnet: nil,
+            modelWindows: nil, model: nil, fiveHourAbsentSince: t - 86_400, source: "usage-poll"
+        )
+        let noteEntries = UsageView(snapshot: noteOnly, now: now).entries
+        expect(texts(Array(noteEntries.prefix(1))).first?.hasPrefix("5시간 한도 없는 계정") == true, "only the note: it comes first: \(noteEntries)")
+        expectEqual(straySeparators(noteEntries), [], "only the note: no stray separator")
+
+        // And the menus built from the real snapshot.
+        for (name, composition) in [
+            ("absent key", MenuComposition.compose(providerMode: .claude, claudeSnapshot: try absentSnapshot(), now: realNow)),
+            ("as stored", MenuComposition.compose(providerMode: .claude, claudeSnapshot: try decodeSnapshot(realSnapshotJSON), now: realNow)),
+            ("codex mode", MenuComposition.compose(providerMode: .codex, claudeSnapshot: try absentSnapshot(), now: realNow))
+        ] {
+            expectEqual(straySeparators(composition.entries), [], "\(name): no stray separator")
+        }
+    }
+
+    /// The collector blanks a window's percentage, keeping its reset, when
+    /// the latest poll did not print it, and adds a "fiveHourSeenAt" key. A
+    /// window like that is no reading: no bar, no ring, nothing to pin, and
+    /// no "ended" text until its reset passes.
+    private static func testBlankedWindowsAreNoReading() throws {
+        let t = now.timeIntervalSince1970
+        let fiveReset = t + 3600
+        let weekReset = t + 2 * 86_400
+        let snapshot = try decodeSnapshot("""
+        {"capturedAt": \(t - 60), "fiveHour": {"used_percentage": null, "resets_at": \(fiveReset)}, \
+        "fiveHourSeenAt": \(t - 4000), \
+        "sevenDay": {"used_percentage": 60, "resets_at": \(weekReset)}, "sevenDayOpus": null, "sevenDaySonnet": null, \
+        "modelWindows": {"Fable": {"used_percentage": null, "resets_at": \(weekReset)}, \
+        "Opus": {"used_percentage": 30, "resets_at": \(weekReset)}}, "source": "usage-poll"}
+        """)
+        expect(snapshot.fiveHour?.resets_at == fiveReset && snapshot.fiveHour?.used_percentage == nil, "decodes, fiveHourSeenAt and all")
+        expect(!snapshot.hasNoFiveHourLimit, "fiveHourSeenAt is not the no-limit key")
+        expectEqual(snapshot.reading(snapshot.fiveHour, at: now), .unavailable, "a blanked 5-hour window with its reset ahead is no reading")
+        expectEqual(snapshot.reading(snapshot.modelWindows?["Fable"], at: now), .unavailable, "nor is a blanked bucket")
+
+        let composition = MenuComposition.compose(providerMode: .claude, claudeSnapshot: snapshot, now: now)
+        let lines = texts(composition.entries)
+        expectEqual(barTexts(composition.entries).count, 2, "bars for the week and Opus only: \(lines)")
+        expect(!lines.contains { $0.hasPrefix("5시간") }, "no 5-hour section")
+        expect(!lines.contains { $0.contains("Fable") }, "no Fable section")
+        let endedWords = ["창 끝남", "리셋됨", "지금 열린 창 없음", "다음 메시지부터"]
+        expect(!lines.contains { line in endedWords.contains { line.contains($0) } }, "no ended text while the resets are ahead")
+        expectEqual(RingCandidate.all(in: snapshot, at: now).map(\.window), [.week, .model("Opus")], "no ring candidates")
+        expectEqual(composition.ring?.window, .week, "auto draws the fullest real reading")
+        expectEqual(composition.ringOptions.map(\.title), ["자동 (가장 많이 쓴 한도)", "주간 전체", "Opus 주간"], "the blanked bucket is not offered to pin")
+        let pinned = MenuComposition.compose(
+            providerMode: .claude, claudeSnapshot: snapshot, ringSetting: .pinned(.model("Fable")), now: now
+        )
+        expectEqual(pinned.ring?.window, .week, "a pinned blanked bucket falls back")
+        expect(texts(pinned.entries).contains("링: Fable 주간 지금 값 없음 · 자동으로 표시"), "and says so")
+        expectEqual(pinned.ringOptions.last, RingOption(
+            title: "Fable 주간 (지금 값 없음)", setting: .pinned(.model("Fable")), isSelected: true, isEnabled: false
+        ), "listed checked and greyed out")
+
+        // Its reset passing before the next poll makes it ended, like any other.
+        let later = texts(UsageView(snapshot: snapshot, now: Date(timeIntervalSince1970: fiveReset + 60)).entries)
+        expect(later.contains("\(clockText(fiveReset))에 창 끝남 · 새 값은 다음 조회 때"), "past its reset: the 5-hour window ended: \(later)")
+        expect(!later.contains { $0.contains("Fable") }, "Fable's reset is still ahead: nothing yet")
+
+        // Every window blanked: nothing to draw.
+        let allBlank = try decodeSnapshot("""
+        {"capturedAt": \(t - 60), "fiveHour": {"used_percentage": null, "resets_at": \(fiveReset)}, \
+        "sevenDay": {"used_percentage": null, "resets_at": \(weekReset)}, \
+        "modelWindows": {"Fable": {"used_percentage": null, "resets_at": \(weekReset)}}, \
+        "fiveHourSeenAt": \(t - 4000), "source": "usage-poll"}
+        """)
+        let nothing = MenuComposition.compose(providerMode: .claude, claudeSnapshot: allBlank, now: now)
+        expectEqual(nothing.image, .unavailable(accessibilityDescription: "Claude 사용량 확인 불가"), "every window blanked: the ring draws ?")
+        expect(
+            texts(nothing.entries).contains("지금 쓸 수 있는 한도 값 없음 — 리셋이 지났거나 조회값에 퍼센트가 없음"),
+            "and the menu says why"
+        )
+        expectEqual(nothing.ringOptions.map(\.title), ["자동 (가장 많이 쓴 한도)"], "every window blanked: nothing to pin")
+    }
+
+    /// Codex's rows and tooltip are only worked out when Codex is what the
+    /// menu shows: a leftover codex-snapshot.json with absurd numbers used to
+    /// trap the Claude and Grok menus on its way to Int.
+    private static func testCodexRowsOnlyInCodexMode() throws {
+        var built: [String] = []
+        func rows() -> [MenuEntry] { built.append("rows"); return [.header("Codex")] }
+        func tip() -> String { built.append("tooltip"); return "AI Usage · Codex" }
+        let t = now.timeIntervalSince1970
+        let fresh = try makeSnapshot(capturedAt: t)
+        let farOff = try makeSnapshot(capturedAt: 1e19)
+        let cases: [(PrimaryUsageProviderMode, CodexUsageSnapshot)] = [(.claude, fresh), (.grokTransition, fresh), (.codex, farOff)]
+        for (mode, codex) in cases {
+            built = []
+            _ = MenuComposition.compose(
+                providerMode: mode, claudeSnapshot: makeClaudeSnapshot(capturedAt: t), codexSnapshot: codex,
+                codexEntries: rows(), codexToolTip: tip(), now: now
+            )
+            expectEqual(built, [], "\(mode): the Codex rows are not built")
+        }
+        built = []
+        let codex = MenuComposition.compose(
+            providerMode: .codex, claudeSnapshot: nil, codexSnapshot: fresh,
+            codexEntries: rows(), codexToolTip: tip(), now: now
+        )
+        expectEqual(built.sorted(), ["rows", "tooltip"], "Codex mode builds them, once each")
+        expectEqual(codex.entries, [.header("Codex")], "and shows them")
     }
 
     private static func decideClaude(

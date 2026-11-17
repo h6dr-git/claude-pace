@@ -143,7 +143,20 @@ struct UsageView {
         if let c = snapshot.capturedAt { foot = "\(dur(now.timeIntervalSince1970 - c)) 전 갱신" }
         if let m = snapshot.displayedModel { foot += foot.isEmpty ? m : " · \(m)" }
         if !foot.isEmpty { e.append(.line(foot)) }
-        return e
+        return UsageView.withoutStraySeparators(e)
+    }
+
+    /// Each section above opens with its own separator, so one that is left
+    /// out (no weekly reading, say) would leave a divider right under the
+    /// block's header, or two in a row under the freshness block. Dropped
+    /// here once, for every section.
+    private static func withoutStraySeparators(_ entries: [MenuEntry]) -> [MenuEntry] {
+        var kept: [MenuEntry] = []
+        for entry in entries {
+            if entry == .separator, kept.last == nil || kept.last == .separator { continue }
+            kept.append(entry)
+        }
+        return kept
     }
 
     /// A weekly window's bar, its reset line (unless left out) and the
@@ -177,18 +190,39 @@ struct UsageView {
                 e.append(.separator)
                 e.append(.header(title(name, .model(bucket.name))))
                 appendWeekly(w, resetLine: !sharesWeeklyReset(resetsAt), to: &e)
-            case .endedSinceLastPoll:
-                guard let ended = endedLine(reading, fiveHour: false) else { continue }
-                e.append(.separator)
-                e.append(.header(name))
-                e.append(.line(ended))
+            case .endedSinceLastPoll(let endedAt):
+                appendEnded(name, endedAt: endedAt, to: &e)
+            case .noOpenWindow(let endedAt) where UsageView.printedBeforeReset(endedAt, capturedAt: snapshot.capturedAt):
+                // The poll ran into the reset: `/usage` printed the bucket a
+                // moment before it, the capture time was stamped a moment
+                // after. It has ended since that output, as above.
+                appendEnded(name, endedAt: endedAt, to: &e)
             case .noOpenWindow, .unavailable:
-                // A poll after its reset left the bucket as it was, so
+                // A poll well after its reset left the bucket as it was, so
                 // `/usage` no longer prints it (a renamed or retired model).
                 continue
             }
         }
         return e
+    }
+
+    /// How long after a reset a capture time can still belong to the output
+    /// that printed the window before it: capturedAt is stamped once the CLI
+    /// has returned, a little after `/usage` looked.
+    static let captureAfterOutputSlack: TimeInterval = 120
+
+    private static func printedBeforeReset(_ endedAt: Double, capturedAt: Double?) -> Bool {
+        guard let capturedAt, capturedAt.isFinite else { return false }
+        return capturedAt - endedAt < captureAfterOutputSlack
+    }
+
+    /// A bucket whose reset has passed since `/usage` printed it: no
+    /// percentage, just when it reset.
+    private func appendEnded(_ name: String, endedAt: Double, to e: inout [MenuEntry]) {
+        guard let ended = endedLine(.endedSinceLastPoll(endedAt: endedAt), fiveHour: false) else { return }
+        e.append(.separator)
+        e.append(.header(name))
+        e.append(.line(ended))
     }
 
     private func sharesWeeklyReset(_ resetsAt: Double) -> Bool {
@@ -231,17 +265,25 @@ struct UsageView {
 
     /// What is left of a weekly window and the even rate that lands exactly
     /// on 100% at the reset: per day with a day or more to go, per hour in
-    /// the last day. Plain arithmetic on the official values; nil once there
-    /// is nothing to plan (used up, or under a minute to the reset).
+    /// the last day. In the last hour a per-hour rate would exceed what is
+    /// left, so the line gives the time to the reset instead (whole minutes).
+    /// Plain arithmetic on the official values; nil once there is nothing to
+    /// plan (used up, or under a minute to the reset).
     static func planningLine(used: Double, remaining: TimeInterval) -> String? {
         guard used.isFinite, (0...100).contains(used), remaining.isFinite, remaining >= 60 else { return nil }
         let shown = Int(used.rounded())
         // The bar already says "사용 100%" from 99.5 up: nothing left to plan.
         guard shown < 100 else { return nil }
-        let day: TimeInterval = 24 * 3600
+        let left = "남은 \(100 - shown)%"
+        let hour: TimeInterval = 3600
+        let day = 24 * hour
+        guard remaining >= hour else {
+            // Rounded down: never more time than there is.
+            return "\(left) · 리셋까지 \(max(Int(remaining / 60), 1))분"
+        }
         let perDay = remaining >= day
-        let rate = (100 - used) / (remaining / (perDay ? day : 3600))
-        return "남은 \(100 - shown)% · 리셋까지 \(perDay ? "하루" : "시간당") \(rateText(rate))"
+        let rate = (100 - used) / (remaining / (perDay ? day : hour))
+        return "\(left) · 리셋까지 \(perDay ? "하루" : "시간당") \(rateText(rate))"
     }
 }
 

@@ -54,13 +54,15 @@ struct MenuComposition: Equatable {
 
     /// The whole menu bar state for one moment. Snapshots may be passed as
     /// stored: windows whose reset has passed by `now` are read as ended.
-    /// Codex's rows and tooltip come in ready-made (`CodexUsageView`).
+    /// Codex's rows and tooltip come in ready-made (`CodexUsageView`), and
+    /// are only worked out when Codex is what the menu shows: a leftover
+    /// codex-snapshot.json is never even formatted under another provider.
     static func compose(
         providerMode: PrimaryUsageProviderMode,
         claudeSnapshot storedClaudeSnapshot: Snapshot?,
         codexSnapshot: CodexUsageSnapshot? = nil,
-        codexEntries: [MenuEntry] = [],
-        codexToolTip: String = "",
+        codexEntries: @autoclosure () -> [MenuEntry] = [],
+        codexToolTip: @autoclosure () -> String = "",
         collectorState: ClaudeCollectorState? = nil,
         pollStatus: ClaudePollStatus = ClaudePollStatus(runningFor: nil, lastAttempt: nil),
         history: MenuHistory = .empty,
@@ -121,8 +123,8 @@ struct MenuComposition: Equatable {
             } else {
                 image = .unavailable(accessibilityDescription: "Codex 사용량 확인 불가")
             }
-            toolTip = codexToolTip
-            entries = codexEntries
+            toolTip = codexToolTip()
+            entries = codexEntries()
         case .grokUnavailable(let reason):
             image = .unavailable(accessibilityDescription: "Grok 사용량 확인 불가")
             toolTip = GrokUsageUnavailablePresentation.toolTip

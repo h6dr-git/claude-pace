@@ -23,6 +23,7 @@ enum MenuPreview {
             providerMode: PrimaryUsageProviderMode.from(environment: environment),
             claudeSnapshot: claudeSnapshot,
             codexSnapshot: codexSnapshot,
+            // Worked out only in Codex mode, as in the app.
             codexEntries: codexView.entries,
             codexToolTip: codexView.toolTip,
             collectorState: collectorState,

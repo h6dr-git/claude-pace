@@ -125,12 +125,14 @@ struct RingChoice: Equatable {
         return best
     }
 
-    /// The "메뉴바 링" submenu: auto, the all-models week, the 5-hour window
-    /// while it has a reading, and every bucket that has one.
+    /// The "메뉴바 링" submenu: auto, then every window that has a reading
+    /// right now (the all-models week, the 5-hour window, each bucket), the
+    /// same windows the ring itself can draw.
     static func options(for setting: RingSetting, in snapshot: Snapshot?, at now: Date) -> [RingOption] {
         var options = [RingOption(title: "자동 (가장 많이 쓴 한도)", setting: .auto, isSelected: setting == .auto)]
-        var windows: [RingWindow] = [.week]
+        var windows: [RingWindow] = []
         if let reading = snapshot?.droppingEndedWindows(at: now) {
+            if reading.usableSevenDay != nil { windows.append(.week) }
             if reading.usableFiveHour != nil { windows.append(.five) }
             windows += reading.usableModelBuckets.map { RingWindow.model($0.name) }
         }

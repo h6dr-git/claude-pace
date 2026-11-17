@@ -183,6 +183,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             providerMode: primaryProviderMode,
             claudeSnapshot: SnapshotStore.shared.load(),
             codexSnapshot: codexSnapshot,
+            // Autoclosures: worked out only in Codex mode, so a leftover
+            // codex-snapshot.json costs the other modes nothing.
             codexEntries: codexView.entries,
             codexToolTip: codexView.toolTip,
             collectorState: ClaudeCollectorStateStore.shared.load(),

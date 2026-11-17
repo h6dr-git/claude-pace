@@ -23,11 +23,16 @@ fail() {
   echo "FAIL: $*" >&2
 }
 
-# preview <provider> [home]: run menu-preview. A process still alive after
-# 10s is the menu bar app starting instead: status 124.
+# preview <provider> [home]: run menu-preview ("unset": with no
+# AI_USAGE_PRIMARY_PROVIDER at all). A process still alive after 10s is the
+# menu bar app starting instead: status 124.
 preview() {
   local provider="$1" target="${2:-$home}"
-  HOME="$target" AI_USAGE_PRIMARY_PROVIDER="$provider" "$bin" menu-preview </dev/null >"$out" 2>"$err" &
+  if [ "$provider" = unset ]; then
+    env -u AI_USAGE_PRIMARY_PROVIDER HOME="$target" "$bin" menu-preview </dev/null >"$out" 2>"$err" &
+  else
+    HOME="$target" AI_USAGE_PRIMARY_PROVIDER="$provider" "$bin" menu-preview </dev/null >"$out" 2>"$err" &
+  fi
   local pid=$! ticks=0
   while kill -0 "$pid" 2>/dev/null; do
     if [ "$ticks" -ge 100 ]; then
@@ -55,6 +60,24 @@ prefix() {
 }
 absent() {
   if grep -qF -- "$2" "$out"; then fail "$1: unexpected: $2"; fi
+}
+no_line() {
+  if grep -qxF -- "$2" "$out"; then fail "$1: unexpected line: $2"; fi
+}
+# above <case> <a> <b>: every line starting with <a> comes before the first
+# line starting with <b>, and both are there.
+above() {
+  awk -v a="$2" -v b="$3" '
+    index($0, a) == 1 { last_a = NR }
+    index($0, b) == 1 && !first_b { first_b = NR }
+    END { exit (last_a && first_b && last_a < first_b) ? 0 : 1 }' "$out" \
+    || fail "$1: \"$2\" is not above \"$3\""
+}
+# tidy <case>: no separator right under the first line (the block's header),
+# and never two in a row.
+tidy() {
+  awk 'NR == 2 && $0 == "—" { bad = 1 } prev == "—" && $0 == "—" { bad = 1 } { prev = $0 } END { exit bad }' "$out" \
+    || fail "$1: a separator right under the header, or two in a row"
 }
 # dump <case> <failures before>: show the preview of a case that failed.
 dump() {
@@ -120,6 +143,12 @@ absent "ultra" "지금 열린 창 없음"
 absent "ultra" "Opus 5 (1M context)"
 absent "ultra" "모델별 주간"
 absent "ultra" "갱신 멈춤"
+# The note comes once, after the limits that do apply: below the bucket's
+# last line (its planning line), not between the week and the bucket.
+above "ultra" "Fable 주간 · 링" "5시간 한도 없는 계정 · 주간 한도만 적용"
+above "ultra" "남은 9% · 리셋까지 하루 " "5시간 한도 없는 계정 · 주간 한도만 적용"
+[ "$(grep -c '^5시간 한도 없는 계정' "$out")" -eq 1 ] || fail "ultra: the note is not there exactly once"
+tidy "ultra"
 [ "$(manifest "$home")" = "$before" ] || fail "ultra: menu-preview changed files under HOME"
 dump "ultra" "$mark"
 
@@ -176,6 +205,7 @@ line "pro" "메뉴바 링 ▸ ✓자동 (가장 많이 쓴 한도) | 주간 전�
 line "pro" "ring: 5시간 22%"
 line "pro" "tooltip: AI Usage · Claude · 링 5시간 22% · 주 5%"
 absent "pro" "5시간 한도 없는 계정"
+tidy "pro"
 dump "pro" "$mark"
 
 # --- 6) the snapshot as stored before the collector knew: today's ended-window
@@ -238,6 +268,8 @@ line "empty home" "Claude"
 line "empty home" "스냅샷 없음 · 아직 한 번도 수집되지 않음"
 line "empty home" "ring: ?"
 line "empty home" "tooltip: Claude 사용량: 공식 조회값 없음"
+# Only windows with a reading are offered, the all-models week included.
+line "empty home" "메뉴바 링 ▸ ✓자동 (가장 많이 쓴 한도)"
 [ -z "$(find "$empty" -mindepth 1 -print)" ] || fail "empty home: menu-preview created files"
 dump "empty home" "$mark"
 
@@ -271,6 +303,105 @@ line "absurd attempt time" "⚠ 갱신 멈춤"
 line "absurd attempt time" "마지막 조회 시도 ? 전"
 line "absurd attempt time" "ring: Fable 주간 91%"
 dump "absurd attempt time" "$mark"
+
+# --- 12) a leftover codex-snapshot.json holding absurd numbers costs the other
+# modes nothing (it used to trap them on its way to Int); Codex mode itself
+# shows "?" for such numbers. A fresh capture time: the runs compared below
+# must not straddle a minute of "N분 전 갱신".
+captured=$(($(date +%s) - 60))
+write_ultra
+rm -f "$app/codex-snapshot.json"
+preview claude
+check_run "claude, no codex file"
+cp "$out" "$scratch/claude-plain"
+preview unset
+check_run "no provider, no codex file"
+cp "$out" "$scratch/unset-plain"
+cat > "$app/codex-snapshot.json" <<'JSON'
+{"schema": "codex-usage.v1", "source": "codex-app-server", "capturedAt": 1e19,
+ "rateLimits": {"limitId": "codex", "planType": "pro",
+   "primary": {"usedPercent": 1e19, "windowDurationMins": 1e19, "resetsAt": 1e19},
+   "secondary": {"usedPercent": -1e19, "windowDurationMins": -1e19, "resetsAt": -1e19}}}
+JSON
+mark=$failures
+preview claude
+check_run "absurd codex file, claude mode"
+cmp -s "$out" "$scratch/claude-plain" \
+  || fail "absurd codex file, claude mode: output changed: $(diff "$scratch/claude-plain" "$out" | head -6)"
+preview unset
+check_run "absurd codex file, no provider"
+cmp -s "$out" "$scratch/unset-plain" \
+  || fail "absurd codex file, no provider: output changed: $(diff "$scratch/unset-plain" "$out" | head -6)"
+line "absurd codex file, no provider" "Grok"
+preview codex
+check_run "absurd codex file, codex mode"
+line "absurd codex file, codex mode" "Codex 스냅샷이 10분을 넘어 기본 링에서 제외"
+line "absurd codex file, codex mode" "ring: ?"
+dump "absurd codex file" "$mark"
+
+# A fresh capture, so the Codex rows are built from those numbers.
+cat > "$app/codex-snapshot.json" <<JSON
+{"schema": "codex-usage.v1", "source": "codex-app-server", "capturedAt": $(($(date +%s) - 60)),
+ "rateLimits": {"limitId": "codex", "planType": "pro",
+   "primary": {"usedPercent": 1e19, "windowDurationMins": 1e19, "resetsAt": 1e19},
+   "secondary": {"usedPercent": 50, "windowDurationMins": 10080, "resetsAt": -1e19}}}
+JSON
+mark=$failures
+preview codex
+check_run "absurd codex windows"
+line "absurd codex windows" "Codex · Pro"
+line "absurd codex windows" "전체 · ?"
+prefix "absurd codex windows" "[■■■■■■■■■■] 사용 ? · 예상 ? "
+line "absurd codex windows" "리셋까지 ? (?)"
+prefix "absurd codex windows" "[■■■■■□□□□□] 사용 50%"
+line "absurd codex windows" "1분 전 갱신"
+line "absurd codex windows" "tooltip: AI Usage · Codex ?"
+dump "absurd codex windows" "$mark"
+rm -f "$app/codex-snapshot.json"
+
+# --- 13) windows the latest poll did not print (percentage blanked, reset kept,
+# fiveHourSeenAt added): no reading, so no section, no ended text, and a
+# pinned week falls back while staying listed, greyed out
+cat > "$app/snapshot.json" <<JSON
+{"capturedAt": $captured, "fiveHour": {"used_percentage": null, "resets_at": $five_reset},
+ "fiveHourSeenAt": $((captured - 3600)),
+ "sevenDay": {"used_percentage": null, "resets_at": $week_reset}, "sevenDayOpus": null, "sevenDaySonnet": null,
+ "modelWindows": {"Fable": {"used_percentage": 91, "resets_at": $week_reset}}, "source": "usage-poll"}
+JSON
+write_state "$captured"
+printf '{"schema":"claudepace-settings.v1","ring":"week"}\n' > "$app/settings.json"
+mark=$failures
+preview claude
+check_run "blanked windows"
+[ "$(sed -n 2p "$out")" = "Fable 주간 · 링" ] || fail "blanked windows: the Fable section is not right under the header"
+line "blanked windows" "링: 주간 전체 지금 값 없음 · 자동으로 표시"
+line "blanked windows" "ring: Fable 주간 91%"
+line "blanked windows" "메뉴바 링 ▸ 자동 (가장 많이 쓴 한도) | Fable 주간 | ✓주간 전체 (지금 값 없음)"
+no_line "blanked windows" "주간 전체 (7일)"
+no_line "blanked windows" "5시간"
+absent "blanked windows" "창 끝남"
+absent "blanked windows" "리셋됨"
+absent "blanked windows" "지금 열린 창 없음"
+[ "$(grep -c '^\[' "$out")" -eq 1 ] || fail "blanked windows: a bar other than Fable's"
+tidy "blanked windows"
+rm -f "$app/settings.json"
+dump "blanked windows" "$mark"
+
+# --- 14) the last hour of a week: the time left instead of a per-hour rate
+# larger than what is left (a fresh now: the reset is minutes away)
+soon="$(date +%s)"
+cat > "$app/snapshot.json" <<JSON
+{"capturedAt": $((soon - 60)), "fiveHour": null, "fiveHourAbsentSince": $absent_since,
+ "sevenDay": {"used_percentage": 64, "resets_at": $((soon + 570))}, "sevenDayOpus": null, "sevenDaySonnet": null,
+ "source": "usage-poll"}
+JSON
+write_state "$((soon - 60))"
+mark=$failures
+preview claude
+check_run "last hour"
+line "last hour" "남은 36% · 리셋까지 9분"
+absent "last hour" "시간당"
+dump "last hour" "$mark"
 
 if [ "$failures" -ne 0 ]; then
   echo "FAIL: $failures menu-preview assertions failed" >&2
