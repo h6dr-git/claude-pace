@@ -201,8 +201,8 @@ struct UsageView {
             case .noOpenWindow, .unavailable:
                 // A poll well after its reset left the bucket as it was, or
                 // one that printed the all-models line left it out and the
-                // collector cleared its percentage: `/usage` no longer
-                // prints it (a renamed or retired model).
+                // collector cleared its percentage and reset: `/usage` no
+                // longer prints it (a renamed or retired model).
                 continue
             }
         }
@@ -240,18 +240,28 @@ struct UsageView {
     }
 
     /// Why the latest poll left the 5-hour window without a number, when it
-    /// did: it printed a session line it could not read, or none although the
-    /// stored window's reset is still ahead (the collector then clears the
-    /// percentage and keeps the reset). The section says so instead of just
-    /// going missing, and is drawn without a bar.
+    /// did, so the section says so instead of just going missing (drawn
+    /// without a bar). Either the poll printed a session line that gave no
+    /// usable window, or it printed none while the stored window may still
+    /// be open: its reset is ahead, or, with no reset (what an unreadable
+    /// line leaves), it is under 5 hours since a poll printed the line. The
+    /// collector clears the percentage in both cases.
     private func fiveHourWithoutNumberLine(_ snapshot: Snapshot) -> String? {
-        guard snapshot.source == "usage-poll" else { return nil }
+        guard snapshot.source == "usage-poll", let window = snapshot.fiveHour else { return nil }
         if snapshot.latestPollPrintedSessionLine {
-            return "사용률 값 없음 — 5시간 줄을 해석하지 못함"
+            if window.used_percentage == nil { return "사용률 값 없음 — 5시간 줄을 해석하지 못함" }
+            if window.resets_at == nil { return "사용률 값 없음 — 5시간 줄의 리셋 시각을 해석하지 못함" }
+            return "사용률 값 없음 — 5시간 줄의 값이 범위를 벗어남"
         }
-        guard let window = snapshot.fiveHour, window.used_percentage == nil,
-              let reset = window.resets_at, reset.isFinite, reset > now.timeIntervalSince1970 else { return nil }
-        return "사용률 값 없음 — 마지막 조회에 5시간 줄이 없음 (창은 \(clock(Date(timeIntervalSince1970: reset)))까지)"
+        guard window.used_percentage == nil else { return nil }
+        let missing = "사용률 값 없음 — 마지막 조회에 5시간 줄이 없음"
+        if let reset = window.resets_at {
+            guard reset.isFinite, reset > now.timeIntervalSince1970 else { return nil }
+            return "\(missing) (창은 \(clock(Date(timeIntervalSince1970: reset)))까지)"
+        }
+        guard let seen = snapshot.fiveHourSeenAt, seen.isFinite,
+              seen + WindowCalc.fiveHourLength > now.timeIntervalSince1970 else { return nil }
+        return missing
     }
 
     private func noFiveHourLimitLine(since: Double?) -> String {
@@ -289,7 +299,7 @@ struct UsageView {
     /// never disagree. Plain arithmetic on the official values; nil once
     /// there is nothing to plan (used up, or under a minute to the reset).
     static func planningLine(used: Double, remaining: TimeInterval) -> String? {
-        guard used.isFinite, (0...100).contains(used), remaining.isFinite, remaining < 1e12 else { return nil }
+        guard used.isFinite, (0...100).contains(used), remaining.isFinite, (0..<1e12).contains(remaining) else { return nil }
         let seconds = Int(remaining.rounded())
         guard seconds >= 60 else { return nil }
         let shown = Int(used.rounded())

@@ -709,9 +709,10 @@ struct UsageProviderSelectionTestMain {
 
         // A wrong-typed extra must not cost the reading.
         let odd = try decodeSnapshot(realSnapshotJSON.replacingOccurrences(
-            of: #""source": "usage-poll"}"#, with: #""source": 7, "fiveHourAbsentSince": "soon"}"#
+            of: #""source": "usage-poll"}"#, with: #""source": 7, "fiveHourAbsentSince": "soon", "fiveHourSeenAt": "soon"}"#
         ))
         expect(odd.fiveHourAbsentSince == nil && odd.source == nil, "malformed extras read as absent")
+        expect(odd.fiveHourSeenAt == nil, "a malformed fiveHourSeenAt reads as absent")
         expectEqual(odd.sevenDay?.used_percentage, 60, "malformed extras keep the rest of the snapshot")
 
         // The key wins over a leftover 5-hour reading: nothing to draw for 5h.
@@ -941,6 +942,9 @@ struct UsageProviderSelectionTestMain {
         expect(UsageView.planningLine(used: 64, remaining: 59.4) == nil, "59.4 s is under a minute: no line")
         expect(UsageView.planningLine(used: 64, remaining: 1e19) == nil, "an absurd time left plans nothing")
         expect(UsageView.planningLine(used: 64, remaining: -.infinity) == nil, "nor a non-finite one")
+        expect(UsageView.planningLine(used: 64, remaining: -1e19) == nil, "nor a negative absurd one")
+        expectEqual(UsageView.planningLine(used: 66, remaining: 86_399.6), "남은 34% · 리셋까지 하루 34%씩", "86399.6 s reads a day, as the reset line says")
+        expectEqual(UsageView.planningLine(used: 66, remaining: 86_399.4), "남은 34% · 리셋까지 시간당 1.4%씩", "86399.4 s reads 23시간 59분: per hour")
         let lastHour = Snapshot(
             capturedAt: now.timeIntervalSince1970 - 60, fiveHour: nil,
             sevenDay: RLWindow(used_percentage: 64, resets_at: now.timeIntervalSince1970 + 570),
@@ -1368,6 +1372,8 @@ struct UsageProviderSelectionTestMain {
         let t = now.timeIntervalSince1970
         let justAhead = MenuComposition.compose(providerMode: .claude, claudeSnapshot: makeClaudeSnapshot(capturedAt: t + 30), now: now)
         expect(texts(justAhead.entries).contains("0초 전 갱신 · Opus 5"), "footer of a capture 30 s ahead: \(texts(justAhead.entries))")
+        let edgeAhead = MenuComposition.compose(providerMode: .claude, claudeSnapshot: makeClaudeSnapshot(capturedAt: t + 60), now: now)
+        expect(texts(edgeAhead.entries).contains("0초 전 갱신 · Opus 5"), "footer of a capture exactly 60 s ahead: \(texts(edgeAhead.entries))")
         let monthAhead = MenuComposition.compose(
             providerMode: .codex, claudeSnapshot: makeClaudeSnapshot(capturedAt: t + 30 * 86_400), now: now
         )
@@ -1605,6 +1611,43 @@ struct UsageProviderSelectionTestMain {
             }
             expectEqual(barTexts(entries).count, 1, "only the week's bar (reset \(reset))")
         }
+        // A line that was read but left no usable window says which part.
+        for (window, reason) in [
+            (#"{"used_percentage": 30, "resets_at": null}"#, "사용률 값 없음 — 5시간 줄의 리셋 시각을 해석하지 못함"),
+            (#"{"used_percentage": 130, "resets_at": \#(fiveReset)}"#, "사용률 값 없음 — 5시간 줄의 값이 범위를 벗어남")
+        ] {
+            let read = try decodeSnapshot("""
+            {"capturedAt": \(t - 60), "fiveHour": \(window), "fiveHourSeenAt": \(t - 60), \
+            "sevenDay": {"used_percentage": 60, "resets_at": \(weekReset)}, "source": "usage-poll"}
+            """)
+            let entries = UsageView(snapshot: read, now: now).entries
+            if let header = entries.firstIndex(of: .header("5시간")) {
+                expectEqual(entries[header + 1], .line(reason), "read but unusable: \(window)")
+            } else {
+                expect(false, "a 5-hour section for \(window): \(texts(entries))")
+            }
+        }
+        // A poll without the line after an unreadable one (no reset left):
+        // the window may be open for 5 hours from that line, and says so.
+        for (seen, shown) in [(t - 600, true), (t - WindowCalc.fiveHourLength - 60, false)] {
+            let after = try decodeSnapshot("""
+            {"capturedAt": \(t - 60), "fiveHour": {"used_percentage": null, "resets_at": null}, "fiveHourSeenAt": \(seen), \
+            "sevenDay": {"used_percentage": 60, "resets_at": \(weekReset)}, "source": "usage-poll"}
+            """)
+            let lines = texts(UsageView(snapshot: after, now: now).entries)
+            expectEqual(lines.contains("사용률 값 없음 — 마지막 조회에 5시간 줄이 없음"), shown,
+                        "no reset, line seen \(Int(t - seen)) s ago: \(lines)")
+            expect(!lines.contains { $0.contains("해석하지 못함") }, "no reset, line seen \(Int(t - seen)) s ago: not unreadable")
+        }
+        // A sighting the collector moved to the second before a poll without
+        // the line (a clock that ran fast) is not this poll's line.
+        let clamped = try decodeSnapshot("""
+        {"capturedAt": \(t - 60), "fiveHour": {"used_percentage": null, "resets_at": \(fiveReset)}, "fiveHourSeenAt": \(t - 61), \
+        "sevenDay": {"used_percentage": 60, "resets_at": \(weekReset)}, "source": "usage-poll"}
+        """)
+        expect(!clamped.latestPollPrintedSessionLine, "a sighting a second before the poll is an earlier poll's")
+        expect(texts(UsageView(snapshot: clamped, now: now).entries).contains(reason), "and gives the missing line with the window's end")
+
         // A readable line's window is drawn as usual, and statusLine output
         // (which never clears a window) says nothing it cannot know.
         let readable = try decodeSnapshot("""

@@ -154,8 +154,10 @@ struct Snapshot: Codable {
     /// 5-hour window to show, ended or otherwise.
     var hasNoFiveHourLimit: Bool { fiveHourAbsentSince != nil }
 
-    /// The poll that wrote this snapshot printed a session line: one it
-    /// could not read, when there is no 5-hour reading to go with it.
+    /// The poll that wrote this snapshot printed a session line: one that
+    /// gave no usable window, when there is no 5-hour reading to go with it.
+    /// Only such a poll stores `fiveHourSeenAt` at its own capture time (one
+    /// without the line moves a sighting that late back a second).
     var latestPollPrintedSessionLine: Bool {
         guard source == "usage-poll", let seen = fiveHourSeenAt, let capturedAt else { return false }
         return seen == capturedAt
