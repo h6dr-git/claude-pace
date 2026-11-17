@@ -9,6 +9,7 @@ on the wall clock. Everything else is compared byte for byte.
 """
 
 import json
+import math
 import os
 import re
 import sys
@@ -52,6 +53,10 @@ def parse_stream(text):
         values.append(value)
 
 
+def finite(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
 def normalize(value, relative):
     """Replace wall-clock values with markers."""
     name = os.path.basename(relative)
@@ -59,10 +64,16 @@ def normalize(value, relative):
         value = dict(value)
         value.pop("generatedAt", None)
         if name in ("snapshot.json", "snapshot.json.tmp", "claude-collector-state.json", "codex-snapshot.json"):
-            # A poll's capturedAt, and poll times the snapshot keeps.
-            for key in ("capturedAt", "fiveHourSeenAt", "fiveHourAbsentSince"):
-                if key in value:
-                    value[key] = "<time>"
+            captured = value.get("capturedAt")
+            if "capturedAt" in value:
+                value["capturedAt"] = "<time>"
+            # Poll times the snapshot keeps: this poll's own or an earlier
+            # one's, and both runs must agree on which. Anything that is not
+            # a time is compared as it is.
+            for key in ("fiveHourSeenAt", "fiveHourAbsentSince"):
+                if finite(value.get(key)):
+                    own = finite(captured) and value[key] == captured
+                    value[key] = "<capturedAt>" if own else "<time>"
         if name == "codex-snapshot.json" and isinstance(value.get("accountUsageCapturedAt"), (int, float)):
             value["accountUsageCapturedAt"] = "<time>"
         if value.get("source") == "claude-statusline" and str(value.get("event_id", "")).startswith("claude-statusline:"):

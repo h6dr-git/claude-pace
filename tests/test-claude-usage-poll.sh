@@ -57,8 +57,26 @@ poll_usage() {
   fi
 }
 
-# run_poll <fixture>: a poll that reads that /usage output.
+# run_poll <fixture>: a poll that reads that /usage output and takes it. One
+# that refuses its output (parse-failed, no-limits, ...) also ends with 0 and
+# leaves the snapshot as it was, which would pass the same checks on that
+# alone, so a poll that does not update the snapshot fails here too.
 run_poll() {
+  local name="poll of ${1##*/} (line ${BASH_LINENO[0]})"
+  poll_usage "$name" FAKE_USAGE_FILE="$1"
+  case "$poll_output" in
+    "snapshot updated: "*) ;;
+    *)
+      failures=$((failures + 1))
+      printf 'FAIL: %s: snapshot not updated (state %s)\n' "$name" \
+        "$(field "$appdir/claude-collector-state.json" status)" >&2
+      ;;
+  esac
+}
+
+# run_refused_poll <fixture>: a poll that must leave the snapshot alone (the
+# checks after it say so, and why).
+run_refused_poll() {
   poll_usage "poll of ${1##*/} (line ${BASH_LINENO[0]})" FAKE_USAGE_FILE="$1"
 }
 
@@ -172,7 +190,7 @@ check_instant "passed reset: stored as printed, not rolled" "$passed_epoch" five
 # --- 2) expired CLI login: snapshot frozen, cause named
 before="$(cat "$appdir/snapshot.json")"
 printf 'Failed to authenticate: OAuth session expired and could not be refreshed\n' > "$scratch/auth.txt"
-run_poll "$scratch/auth.txt"
+run_refused_poll "$scratch/auth.txt"
 check "signed-out: snapshot untouched" "$before" "$(cat "$appdir/snapshot.json")"
 check "signed-out: state" "signed-out" "$(field "$appdir/claude-collector-state.json" status)"
 
@@ -183,13 +201,13 @@ You are currently using your subscription to power your Claude Code usage
 What's contributing to your limits usage?
 Last 24h · 104 requests · 3 sessions
 OUT
-run_poll "$scratch/nolimits.txt"
+run_refused_poll "$scratch/nolimits.txt"
 check "no-limits: snapshot untouched" "$before" "$(cat "$appdir/snapshot.json")"
 check "no-limits: state" "no-limits" "$(field "$appdir/claude-collector-state.json" status)"
 
 # --- 4) empty output
 : > "$scratch/empty.txt"
-run_poll "$scratch/empty.txt"
+run_refused_poll "$scratch/empty.txt"
 check "empty: snapshot untouched" "$before" "$(cat "$appdir/snapshot.json")"
 check "empty: state" "empty-output" "$(field "$appdir/claude-collector-state.json" status)"
 

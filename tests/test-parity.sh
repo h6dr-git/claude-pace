@@ -302,6 +302,19 @@ OUT
   printf '%s\n' "You are currently using your subscription" "" "Last 24h · 104 requests · 3 sessions" > "$usage/nolimits.txt"
   printf '%s\n' 'Current session: unknown' 'Current week (all models): n/a' > "$usage/parsefail.txt"
   : > "$usage/empty.txt"
+  # A 5-hour reset about 3 hours ahead whatever the date (the fixed ones above
+  # are ahead only in part of the year), written once so that both runs read
+  # the same text.
+  [ -e "$usage/open.txt" ] || {
+    printf 'Current session: 95%% used · resets %s (Asia/Seoul)\n' "$(python3 -c '
+import datetime
+from zoneinfo import ZoneInfo
+t = datetime.datetime.now(ZoneInfo("Asia/Seoul")) + datetime.timedelta(hours=3)
+month = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()[t.month - 1]
+print(month, t.day, "at", "%d:50%s" % (t.hour % 12 or 12, "am" if t.hour < 12 else "pm"))
+')"
+    printf '%s\n' 'Current week (all models): 41% used · resets Aug 27 at 2pm (Asia/Seoul)'
+  } > "$usage/open.txt"
 
   claude_poll() {  # claude_poll <name> <fixture> [VAR=value...]
     local name="$1" fixture="$2"
@@ -320,6 +333,10 @@ OUT
   mkdir -p "$home/_out"
   printf '%s' '{"capturedAt": 1, "fiveHour": {"used_percentage": 50, "resets_at": 1700000000, "extra": "kept"}, "model": "Opus", "raw_rate_limits": {"x": 1}, "sevenDayOpus": null}' > "$app/snapshot.json"
   claude_poll full full.txt
+  # A poll without a session line keeps the time the one before saw it
+  # (fiveHourSeenAt). A second on, that can never be this poll's own
+  # capturedAt, which compare.py tells apart from any other poll time.
+  sleep 1
   claude_poll weekonly weekonly.txt
   claude_poll models models.txt
   claude_poll variants variants.txt
@@ -337,6 +354,15 @@ OUT
   claude_poll broken-snapshot full.txt
   printf '%s' '[1,2,3]' > "$app/snapshot.json"
   claude_poll array-snapshot models.txt
+  # The session line gone before its reset: the 5-hour percentage goes, the
+  # reset stays (a second on, as after `full`).
+  claude_poll session-open open.txt
+  sleep 1
+  claude_poll session-gone weekonly.txt
+  # A 5-hour percentage without a reset, stored before fiveHourSeenAt: a poll
+  # without a session line dates it by the poll before.
+  printf '%s' '{"capturedAt": 1793000000, "fiveHour": {"used_percentage": 3}}' > "$app/snapshot.json"
+  claude_poll legacy-window weekonly.txt
 }
 
 # --- Codex app-server polling ------------------------------------------------
