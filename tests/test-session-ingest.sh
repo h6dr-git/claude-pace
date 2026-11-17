@@ -168,6 +168,13 @@ glued_checks() {
   check "$name: the glued line's record matches the plain one" "2 1" "$(took 102) $(
     grep -F -- "$(printf "$marker" 102)" "$home/Library/Application Support/ClaudePace/usage-log.jsonl" |
       sed -E 's/"event_id":"[^"]*"|"sourcePath":"[^"]*"//g' | sort -u | wc -l | tr -d ' ')"
+
+  # 6) a file with CRLF line ends: every line, the glued one too, ends in \r
+  line="$("$event" 111)"
+  { "$event" 110; printf '\r\n%s' "${line:0:60}"; "$event" 112; printf '\r\n'; } >> "$file"
+  "$ingest"
+  check "$name: a CRLF line is ingested" 1 "$(took 110)"
+  check "$name: a line glued onto a half line in a CRLF file is ingested, once" "9 1 0" "$(count) $(took 112) $(took 111)"
 }
 
 home="$scratch/codex-glued"
