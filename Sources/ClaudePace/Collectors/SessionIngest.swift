@@ -107,9 +107,14 @@ enum SessionIngest {
             if offset == size { continue }
 
             func ingest(_ line: Data, salvaging: Bool) {
-                guard line.range(of: settings.needle) != nil,
-                      let value = (try? JSONParser.parse(line))
-                        ?? (salvaging ? gluedObject(in: line, needle: settings.needle) : nil) else { return }
+                guard line.range(of: settings.needle) != nil else { return }
+                if let value = try? JSONParser.parse(line) {
+                    take(value)
+                } else if salvaging {
+                    gluedLines(in: line, needle: settings.needle).forEach(take)
+                }
+            }
+            func take(_ value: JSONValue) {
                 let event: (id: String, record: JSONObject)?
                 switch source {
                 case .codex: event = codexEvent(value, file: file)
@@ -192,23 +197,28 @@ enum SessionIngest {
         return pending.isEmpty ? nil : (pending, position)
     }
 
-    /// A complete line glued onto a broken one. A writer that dies in the
-    /// middle of a line never writes its newline, so the next line put in
-    /// the same file (say by `claude --resume`, which keeps appending to the
-    /// session file) runs on from the broken half, and the two fail to parse
-    /// as one line. Returns the first suffix, from the left and never the
-    /// whole line, that starts with `{"` and parses as one complete object,
-    /// if it holds the needle itself, as any line that gets parsed must.
+    /// The complete lines in a line glued onto a broken one. A writer that
+    /// dies before the end of a line never writes its newline, so the next
+    /// line put in the same file (say by `claude --resume`, which keeps
+    /// appending to the session file) runs on from it, and the two fail to
+    /// parse as one line. The glued line is the first suffix, from the left
+    /// and never the whole line, that starts with `{"` and parses as one
+    /// complete object. What comes before it is mostly a broken half. But a
+    /// writer can die after a line's JSON and just before its newline, and
+    /// then that part is a complete line: a run between the two writes would
+    /// have taken it as a complete last line. A line cut anywhere else never
+    /// parses as one object, so each part, in file order, is taken when it
+    /// does and holds the needle itself, as any line that gets parsed must.
     ///
     /// At most one suffix parses that way, and it starts at the `{` that the
     /// line's last `}` closes. (Inside valid JSON a `"` delimits a string
     /// exactly when an even number of backslashes come right before it, so
     /// which quotes delimit strings, and so which brackets count, does not
     /// depend on where reading started.) One pass from the right finds that
-    /// brace and the suffix is parsed once: however long the line (Claude
+    /// brace and each part is parsed once: however long the line (Claude
     /// lines can be megabytes) and however many objects its broken half
-    /// holds, salvage costs at most about two more reads of it.
-    private static func gluedObject(in line: Data, needle: Data) -> JSONValue? {
+    /// holds, salvage costs a few more reads of it at most.
+    private static func gluedLines(in line: Data, needle: Data) -> [JSONValue] {
         let quote = UInt8(ascii: "\"")
         let start = line.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) -> Int? in
             var index = bytes.count - 1
@@ -236,12 +246,14 @@ enum SessionIngest {
             }
             return nil
         }
-        guard let start else { return nil }
-        let suffix = line[(line.startIndex + start)...]
-        guard suffix.range(of: needle) != nil,
-              let value = try? JSONParser.parse(suffix),
-              case .object = value else { return nil }
-        return value
+        guard let start else { return [] }
+        let glued = line.startIndex + start
+        return [line[..<glued], line[glued...]].compactMap { part in
+            guard part.range(of: needle) != nil,
+                  let value = try? JSONParser.parse(part),
+                  case .object = value else { return nil }
+            return value
+        }
     }
 
     /// `$(jq -r 'path // empty')`: jq's raw text of the value, or "".

@@ -3,8 +3,10 @@
 # scripts stored the file size as the next offset, so the rest of such a line
 # was read on its own next time and the event was lost. Now the line is read
 # again, whole, once it is finished — and no event is ingested twice, however
-# many reads the line spans. When a writer never finished its line and the
-# next line got glued onto it, that next line is still ingested.
+# many reads the line spans. The stored offset stops where that line starts.
+# When a writer never finished its line and the next line got glued onto it,
+# that next line is still ingested, and so is the line before it when only
+# its newline was lost.
 set -uo pipefail
 
 repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
@@ -30,6 +32,10 @@ records() {
   if [ -f "$log" ]; then grep -c "\"source\":\"$2\"" "$log"; else echo 0; fi
 }
 
+# offset_of <offsets dir> <file>: the offset stored for that session file
+offset_of() { cat "$1/$(printf '%s' "$2" | shasum -a 256 | cut -d' ' -f1).offset" 2>/dev/null; }
+size_of() { wc -c < "$1" | tr -d ' '; }
+
 # --- Codex -------------------------------------------------------------------
 codex_line() {  # codex_line <minute> <total tokens>
   printf '{"timestamp":"2026-10-28T01:%02d:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":%d},"last_token_usage":{"total_tokens":1}}}}' "$1" "$2"
@@ -37,6 +43,7 @@ codex_line() {  # codex_line <minute> <total tokens>
 home="$scratch/codex"
 mkdir -p "$home/.codex/sessions/2026/10/28"
 file="$home/.codex/sessions/2026/10/28/rollout-test.jsonl"
+offsets="$home/Library/Application Support/ClaudePace/.codex-offsets"
 first="$(codex_line 0 10)"
 second="$(codex_line 1 20)"
 third="$(codex_line 2 30)"
@@ -46,11 +53,13 @@ ingest_codex() { HOME="$home" "$bin" ingest-codex-sessions >/dev/null 2>&1; }
 { printf '%s\n' "$first"; printf '%s' "${second:0:50}"; } > "$file"
 ingest_codex
 check "codex: the finished line is ingested" 1 "$(records "$home" codex-session)"
+check "codex: the offset stops where the half-written line starts" $((${#first} + 1)) "$(offset_of "$offsets" "$file")"
 
 # 2) once the line is finished it is picked up, exactly once
 printf '%s\n' "${second:50}" >> "$file"
 ingest_codex
 check "codex: the half-written line is picked up later" 2 "$(records "$home" codex-session)"
+check "codex: then the offset is the end of the file" "$(size_of "$file")" "$(offset_of "$offsets" "$file")"
 ingest_codex
 check "codex: nothing is ingested twice" 2 "$(records "$home" codex-session)"
 
@@ -59,9 +68,10 @@ check "codex: nothing is ingested twice" 2 "$(records "$home" codex-session)"
 printf '%s' "$third" >> "$file"
 ingest_codex
 check "codex: a complete unterminated line is ingested" 3 "$(records "$home" codex-session)"
+check "codex: and the offset moves past it" "$(size_of "$file")" "$(offset_of "$offsets" "$file")"
 printf '\n' >> "$file"
 ingest_codex
-check "codex: its newline adds nothing" 3 "$(records "$home" codex-session)"
+check "codex: its newline adds nothing" "3 $(size_of "$file")" "$(records "$home" codex-session) $(offset_of "$offsets" "$file")"
 
 # --- Claude ------------------------------------------------------------------
 claude_line() {  # claude_line <request id> <output tokens>
@@ -70,6 +80,7 @@ claude_line() {  # claude_line <request id> <output tokens>
 home="$scratch/claude"
 mkdir -p "$home/.claude/projects/-Users-me-project"
 file="$home/.claude/projects/-Users-me-project/session.jsonl"
+offsets="$home/Library/Application Support/ClaudePace/.claude-session-offsets"
 one="$(claude_line req_1 5)"
 two="$(claude_line req_2 7)"
 ingest_claude() { HOME="$home" "$bin" ingest-claude-sessions >/dev/null 2>&1; }
@@ -77,9 +88,11 @@ ingest_claude() { HOME="$home" "$bin" ingest-claude-sessions >/dev/null 2>&1; }
 { printf '%s\n' "$one"; printf '%s' "${two:0:40}"; } > "$file"
 ingest_claude
 check "claude: the finished line is ingested" 1 "$(records "$home" claude-session)"
+check "claude: the offset stops where the half-written line starts" $((${#one} + 1)) "$(offset_of "$offsets" "$file")"
 printf '%s\n' "${two:40}" >> "$file"
 ingest_claude
 check "claude: the half-written line is picked up later" 2 "$(records "$home" claude-session)"
+check "claude: then the offset is the end of the file" "$(size_of "$file")" "$(offset_of "$offsets" "$file")"
 ingest_claude
 check "claude: nothing is ingested twice" 2 "$(records "$home" claude-session)"
 
@@ -87,7 +100,8 @@ check "claude: nothing is ingested twice" 2 "$(records "$home" claude-session)"
 # A writer that dies mid-line never writes its newline, so the next line put in
 # the same file (say by `claude --resume`) is glued onto the broken half. That
 # complete line is read out of the glued one, once, and only if the source
-# would take it as a line of its own.
+# would take it as a line of its own. So is the line before it, when its writer
+# died after its JSON, just before the newline.
 
 # Brackets and braces inside strings, and an odd number of escaped quotes with
 # brackets after the first: a scan that took every quote for a delimiter would
@@ -116,7 +130,7 @@ took() { grep -cF -- "$(printf "$marker" "$1")" "$home/Library/Application Suppo
 # $plain_file with $ingest. A half that ends right after <key> reads the glued
 # line as that key's value.
 glued_checks() {
-  local name="$1" event="$2" other="$3" marker="$4" key="$5" line
+  local name="$1" event="$2" other="$3" marker="$4" key="$5" line waiting
   count() { records "$home" "$source"; }
 
   # 1) a run lands on a half-written line, then another writer's line is
@@ -137,9 +151,10 @@ glued_checks() {
   # 2) the glued line has no newline yet: it waits for one, like any last
   #    line that is not JSON on its own
   line="$("$event" 103)"
+  waiting="$(size_of "$file")"
   { printf '%s' "${line%%"$key"*}$key"; "$event" 104; } >> "$file"
   "$ingest"
-  check "$name: a glued last line waits for its newline" 2 "$(count)"
+  check "$name: a glued last line waits for its newline" "2 $waiting" "$(count) $(offset_of "$offsets" "$file")"
   echo >> "$file"
   "$ingest"
   check "$name: and is ingested once it has one" "3 1 0" "$(count) $(took 104) $(took 103)"
@@ -178,6 +193,31 @@ glued_checks() {
   "$ingest"
   check "$name: a CRLF line is ingested" 1 "$(took 110)"
   check "$name: a line glued onto a half line in a CRLF file is ingested, once" "9 1 0" "$(count) $(took 112) $(took 111)"
+
+  # 7) the writer died after the JSON, just before the newline: that line is
+  #    complete, and is ingested along with the line glued onto it (a run
+  #    between the two would have taken it as a complete last line). Also when
+  #    the glued line is one this source passes over, and in a CRLF file that
+  #    lost only the \n. A complete line the source passes over stays passed
+  #    over.
+  {
+    "$event" 113; "$event" 114; echo
+    "$event" 115; "$other"; echo
+    "$other"; "$event" 116; echo
+    "$event" 117; printf '\r'; "$event" 118; printf '\r\n'
+  } >> "$file"
+  "$ingest"
+  check "$name: a complete line that lost its newline is ingested with the glued one" "15 1 1 1 1 1 1" \
+    "$(count) $(took 113) $(took 114) $(took 115) $(took 116) $(took 117) $(took 118)"
+
+  # 8) but a complete object that ends a broken half is not a line: here an
+  #    inner one, the half cut right after it
+  { printf '%s' '{"type":"progress","data":{"message":'; "$event" 119; "$event" 120; echo; } >> "$file"
+  "$ingest"
+  check "$name: an object that ends a broken half is not taken" "16 0 1" "$(count) $(took 119) $(took 120)"
+  rm -f "$offsets"/*.offset
+  "$ingest"
+  check "$name: reading the file again from the start adds nothing" 16 "$(count)"
 }
 
 home="$scratch/codex-glued"
@@ -198,10 +238,11 @@ glued_checks claude claude_event claude_other '"output_tokens":%d,' '"usage":'
 
 # --- A long line read in pieces ----------------------------------------------
 # A line of several MiB spans many reads. Written in two parts, it waits for
-# its newline, then is ingested once along with the line after it. It is
-# exactly 3 MiB, so the run that finishes it finds its newline as the first
-# byte of a read (reads are 1 MiB). A long complete last line without a newline
-# is taken at once.
+# its newline (the offset stops where it starts), then is ingested once along
+# with the line after it. It is exactly 3 MiB, so the run that finishes it,
+# reading from that offset, finds its newline as the first byte of a read
+# (reads are 1 MiB). A long complete last line without a newline is taken at
+# once.
 long_line() {  # long_line <output tokens> <bytes>: an assistant turn that long
   local front back
   front="$(printf '{"type":"assistant","requestId":"req_long_%d","timestamp":"2026-10-28T05:00:00Z","message":{"model":"claude-opus-5-5","content":[{"type":"text","text":"' "$1")"
@@ -213,24 +254,29 @@ long_line() {  # long_line <output tokens> <bytes>: an assistant turn that long
 home="$scratch/claude-long"
 mkdir -p "$home/.claude/projects/-Users-me-project"
 file="$home/.claude/projects/-Users-me-project/long.jsonl"
+offsets="$home/Library/Application Support/ClaudePace/.claude-session-offsets"
 long="$scratch/long-line"
 marker='"output_tokens":%d,'
 long_line 300 $((3 << 20)) > "$long"
 cut=$(((2 << 20) + 777))
 { claude_line req_a 1; echo; head -c "$cut" "$long"; } > "$file"
 ingest_claude
-check "long line: it waits for its newline" "1 0" "$(records "$home" claude-session) $(took 300)"
+check "long line: it waits for its newline" "1 0 $(($(claude_line req_a 1 | wc -c) + 1))" \
+  "$(records "$home" claude-session) $(took 300) $(offset_of "$offsets" "$file")"
 { tail -c +$((cut + 1)) "$long"; echo; claude_line req_b 2; echo; } >> "$file"
 ingest_claude
-check "long line: once finished it is ingested, once" "3 1 1" "$(records "$home" claude-session) $(took 300) $(took 2)"
+check "long line: once finished it is ingested, once" "3 1 1 $(size_of "$file")" \
+  "$(records "$home" claude-session) $(took 300) $(took 2) $(offset_of "$offsets" "$file")"
 ingest_claude
 check "long line: a later run adds nothing" 3 "$(records "$home" claude-session)"
 long_line 301 $(((3 << 20) + 4321)) >> "$file"
 ingest_claude
-check "long line: a complete one without a newline is taken at once" "4 1" "$(records "$home" claude-session) $(took 301)"
+check "long line: a complete one without a newline is taken at once" "4 1 $(size_of "$file")" \
+  "$(records "$home" claude-session) $(took 301) $(offset_of "$offsets" "$file")"
 echo >> "$file"
 ingest_claude
-check "long line: its newline adds nothing" 4 "$(records "$home" claude-session)"
+check "long line: its newline adds nothing" "4 $(size_of "$file")" \
+  "$(records "$home" claude-session) $(offset_of "$offsets" "$file")"
 
 if [ "$failures" -ne 0 ]; then
   echo "FAIL: $failures session-ingest assertions failed" >&2
