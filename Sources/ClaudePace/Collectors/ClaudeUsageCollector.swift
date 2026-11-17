@@ -230,11 +230,14 @@ enum ClaudeUsageCollector {
         // open", and to later polls as "none open", the ground for concluding
         // there is no 5-hour limit. Without a reset the window counts as open
         // until 5 hours after this poll (`fiveHourSeenAt`, see `noWindowOpen`).
+        // Its percentage goes either way: this poll did not read one, and an
+        // earlier poll's number may not pass for the current one.
         func possiblyOpen(_ old: JSONValue) -> JSONValue {
-            if let reset = finiteNumber(old.objectValue?["resets_at"]), reset > now.timeIntervalSince1970 {
-                return old
-            }
             var updated = old.objectValue ?? JSONObject()
+            updated["used_percentage"] = .null
+            if let reset = finiteNumber(updated["resets_at"]), reset > now.timeIntervalSince1970 {
+                return .object(updated)
+            }
             updated["resets_at"] = .null
             return .object(updated)
         }
@@ -431,17 +434,26 @@ enum ClaudeUsageCollector {
     /// window without a reset, from before `fiveHourSeenAt` existed, is dated
     /// by the previous poll, no earlier than its real sighting, so that it
     /// ends 5 hours on instead of blocking the conclusion for good.
+    ///
+    /// No sighting is later than this poll. One stored ahead of it (taken
+    /// while the Mac's clock ran fast, since put right) becomes this poll's
+    /// time: still the latest a window may have been open, but no longer a
+    /// block on the conclusion for as long as the clock was off.
     private static func settleWithoutSessionLine(
         _ snapshot: inout JSONObject, previous: JSONObject, at now: Date
     ) {
+        let capturedAt = Int(now.timeIntervalSince1970)
+        if let seen = finiteNumber(previous["fiveHourSeenAt"]), seen > Double(capturedAt) {
+            snapshot["fiveHourSeenAt"] = .int(capturedAt)
+        }
         switch storedFiveHour(previous["fiveHour"]) {
         case .resets(let reset) where reset > now.timeIntervalSince1970:
             guard case .object(var window)? = snapshot["fiveHour"] else { return }
             window["used_percentage"] = .null
             snapshot["fiveHour"] = .object(window)
         case .unbounded where finiteNumber(previous["fiveHourSeenAt"]) == nil:
-            guard let then = previous["capturedAt"], finiteNumber(then) != nil else { return }
-            snapshot["fiveHourSeenAt"] = then
+            guard let then = previous["capturedAt"], let at = finiteNumber(then) else { return }
+            snapshot["fiveHourSeenAt"] = at > Double(capturedAt) ? .int(capturedAt) : then
         default:
             break
         }

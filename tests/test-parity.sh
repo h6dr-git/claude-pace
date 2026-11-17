@@ -301,6 +301,7 @@ OUT
   printf '%s\n' 'Error: Please Run /Login to continue' > "$usage/auth-case.txt"
   printf '%s\n' "You are currently using your subscription" "" "Last 24h · 104 requests · 3 sessions" > "$usage/nolimits.txt"
   printf '%s\n' 'Current session: unknown' 'Current week (all models): n/a' > "$usage/parsefail.txt"
+  printf '%s\n' 'Current session: ?% used' 'Current week (all models): 41% used · resets Aug 27 at 2pm (Asia/Seoul)' > "$usage/session-unread.txt"
   : > "$usage/empty.txt"
   # A 5-hour reset about 3 hours ahead whatever the date (the fixed ones above
   # are ahead only in part of the year), written once so that both runs read
@@ -363,6 +364,19 @@ print(month, t.day, "at", "%d:50%s" % (t.hour % 12 or 12, "am" if t.hour < 12 el
   # without a session line dates it by the poll before.
   printf '%s' '{"capturedAt": 1793000000, "fiveHour": {"used_percentage": 3}}' > "$app/snapshot.json"
   claude_poll legacy-window weekonly.txt
+  # ...no later than this poll, though, when that poll was stamped ahead of
+  # it (a clock that ran fast); and a sighting stored ahead becomes this
+  # poll's time.
+  printf '%s' '{"capturedAt": 4000000000, "fiveHour": {"used_percentage": 3}}' > "$app/snapshot.json"
+  claude_poll legacy-window-ahead weekonly.txt
+  printf '%s' '{"capturedAt": 1793000000, "fiveHourSeenAt": 4000000000, "fiveHour": {"used_percentage": 9, "resets_at": 1793000000}}' > "$app/snapshot.json"
+  claude_poll seen-ahead weekonly.txt
+  # A session line that cannot be read: the 5-hour percentage goes, a reset
+  # still ahead stays and one already passed goes too.
+  claude_poll session-open-again open.txt
+  claude_poll session-unread session-unread.txt
+  printf '%s' '{"capturedAt": 1793000000, "fiveHour": {"used_percentage": 9, "resets_at": 1793000000}}' > "$app/snapshot.json"
+  claude_poll session-unread-ended session-unread.txt
 }
 
 # --- Codex app-server polling ------------------------------------------------

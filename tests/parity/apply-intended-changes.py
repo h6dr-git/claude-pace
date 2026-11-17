@@ -88,12 +88,32 @@ CHANGES = [
         "    new['fiveHourSeenAt'] = new['capturedAt']\n",
     ),
     (
+        # A session line that could not be read keeps the stored 5-hour
+        # window's reset only while it is ahead (a passed one would read as
+        # "no window open"), and its percentage not at all: this poll read
+        # none, and an earlier poll's number may not pass for the current one.
+        "tools/poll-usage.sh",
+        "if session_line:\n"
+        "    new['fiveHourSeenAt'] = new['capturedAt']\n",
+        "if session_line:\n"
+        "    new['fiveHourSeenAt'] = new['capturedAt']\n"
+        "if session_line and five is None:\n"
+        "    w = dict(new['fiveHour']) if isinstance(new['fiveHour'], dict) else {}\n"
+        "    w['used_percentage'] = None\n"
+        "    r = w.get('resets_at')\n"
+        "    if not (isinstance(r, (int, float)) and not isinstance(r, bool)\n"
+        "            and r == r and abs(r) != float('inf') and r > time.time()):\n"
+        "        w['resets_at'] = None\n"
+        "    new['fiveHour'] = w\n",
+    ),
+    (
         # A poll without a session line keeps the stored 5-hour window, but a
         # percentage whose reset is still ahead loses its number (no poll
         # printed it as current: the limit may have gone mid-window) and keeps
         # the reset. A window without a reset and without `fiveHourSeenAt`
         # (stored before it existed) is dated by the previous poll instead, so
-        # that it can expire.
+        # that it can expire. No sighting is later than this poll: one stored
+        # ahead of it (a clock that ran fast) becomes this poll's time.
         "tools/poll-usage.sh",
         "new['sevenDay'] = window(cur.get('sevenDay') or {}, week, week_reset)\n",
         "\n"
@@ -104,11 +124,13 @@ CHANGES = [
         "if not session_line:\n"
         "    old = cur.get('fiveHour')\n"
         "    old_reset = old.get('resets_at') if isinstance(old, dict) else None\n"
+        "    if finite(cur.get('fiveHourSeenAt')) and cur['fiveHourSeenAt'] > new['capturedAt']:\n"
+        "        new['fiveHourSeenAt'] = new['capturedAt']\n"
         "    if finite(old_reset) and old_reset > time.time():\n"
         "        new['fiveHour'] = dict(old, used_percentage=None)\n"
         "    elif (old is not None and old != {} and not finite(old_reset)\n"
         "          and not finite(cur.get('fiveHourSeenAt')) and finite(cur.get('capturedAt'))):\n"
-        "        new['fiveHourSeenAt'] = cur['capturedAt']\n"
+        "        new['fiveHourSeenAt'] = min(cur['capturedAt'], new['capturedAt'])\n"
         "new['sevenDay'] = window(cur.get('sevenDay') or {}, week, week_reset)\n",
     ),
     (
