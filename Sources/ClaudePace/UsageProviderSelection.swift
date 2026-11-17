@@ -161,6 +161,11 @@ extension CodexUsageSnapshot {
             ?? rateLimitsByLimitId?.sorted(by: { $0.key < $1.key }).first?.value
     }
 
+    /// The window the menu-bar ring draws in Codex mode.
+    var menuBarWindow: CodexRateLimitWindow? {
+        primaryRateLimit?.primary ?? primaryRateLimit?.secondary
+    }
+
     func hasFreshCapture(
         at now: Date,
         maximumAge: TimeInterval,

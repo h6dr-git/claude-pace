@@ -42,7 +42,8 @@ enum Bar {
         return img
     }
 
-    /// Compact ring for the menu bar (the real-time 5h view). Square footprint.
+    /// Compact ring for the menu bar (the window the ring setting picks, see
+    /// RingChoice). Square footprint.
     /// Fill arc = used (grows clockwise from 12 o'clock); radial tick = pace
     /// ("where you should be by now" = elapsed fraction). Monochrome template.
     /// `dimmed` fades the whole ring for a reading that has stopped updating,

@@ -7,6 +7,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let primaryProviderMode = PrimaryUsageProviderMode.from(
         environment: ProcessInfo.processInfo.environment
     )
+    /// settings.json: which Claude window the menu-bar ring shows.
+    private let settings = ClaudePaceSettingsStore(
+        home: FileManager.default.homeDirectoryForCurrentUser.path
+    )
 
     // Sleep and wake are timed on systemUptime, which stops while the Mac
     // sleeps and never jumps with clock changes.
@@ -170,97 +174,48 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if menuNeedsRebuild { render() }
     }
 
+    /// Reads everything the menu shows, lets MenuComposition decide what it
+    /// says, and applies that: ring image, tooltip, menu items.
     private func render() {
         let codexSnapshot = CodexSnapshotStore.shared.load()
         let codexView = CodexUsageView(snapshot: codexSnapshot)
-        let claudeSnapshot = SnapshotStore.shared.load()
-        let claudeView = UsageView(snapshot: claudeSnapshot, polled: primaryProviderMode.shouldPollClaude)
-        let collectorState = ClaudeCollectorStateStore.shared.load()
-
-        let decision = PrimaryUsageSelector.decide(
+        let composition = MenuComposition.compose(
             providerMode: primaryProviderMode,
+            claudeSnapshot: SnapshotStore.shared.load(),
             codexSnapshot: codexSnapshot,
-            claudeSnapshot: claudeSnapshot,
-            claudeCollectorState: collectorState
+            codexEntries: codexView.entries,
+            codexToolTip: codexView.toolTip,
+            collectorState: ClaudeCollectorStateStore.shared.load(),
+            pollStatus: ClaudeUsagePoller.shared.status,
+            history: MenuHistory(UsageHistoryStore.shared.loadSummary()),
+            ringSetting: settings.loadRing(),
+            now: Date()
         )
-        let claudeStale = SnapshotFreshness.of(claudeSnapshot).isStale
-        let pollStatus = ClaudeUsagePoller.shared.status
-        var entries: [MenuEntry]
-        switch decision {
-        case .claude:
-            statusItem.button?.image = claudeView.menuBarImage(dimmed: claudeStale) ?? unavailableStatusImage(
-                accessibilityDescription: "Claude 사용량 확인 불가"
-            )
-            statusItem.button?.toolTip = claudeView.toolTip + (claudeStale ? " · 갱신 멈춤" : "")
-            entries = [.header("Claude")]
-            // Say up front when the numbers below are old, before any of them.
-            let freshness = FreshnessPresentation.entries(
-                snapshot: claudeSnapshot, poll: pollStatus, numbersShown: true
-            )
-            if !freshness.isEmpty {
-                entries.append(contentsOf: freshness)
-                entries.append(.separator)
-            }
-            entries.append(contentsOf: claudeView.entries)
-            entries.append(contentsOf: collectorWarningEntries(collectorState))
-        case .claudeUnavailable(let reason):
-            statusItem.button?.image = unavailableStatusImage(
-                accessibilityDescription: "Claude 사용량 확인 불가"
-            )
-            statusItem.button?.toolTip = ClaudeUsageUnavailablePresentation.toolTip
-            entries = claudeUnavailableEntries(reason: reason)
-            // Same place as above: right under the "Claude" header.
-            let freshness = FreshnessPresentation.entries(
-                snapshot: claudeSnapshot, poll: pollStatus, numbersShown: false
-            )
-            if !freshness.isEmpty {
-                entries.insert(contentsOf: freshness + [MenuEntry.separator], at: 1)
-            }
-        case .codex:
-            statusItem.button?.image = codexView.menuBarImage ?? unavailableStatusImage(
-                accessibilityDescription: "Codex 사용량 확인 불가"
-            )
-            statusItem.button?.toolTip = codexView.toolTip
-            entries = codexView.entries
-        case .grokUnavailable(let reason):
-            statusItem.button?.image = unavailableStatusImage(
-                accessibilityDescription: "Grok 사용량 확인 불가"
-            )
-            statusItem.button?.toolTip = GrokUsageUnavailablePresentation.toolTip
-            entries = grokUnavailableEntries(reason: reason)
-        }
-
-        // Claude stays a secondary readout under the other providers; under the
-        // Claude provider it is already the primary block above.
-        if !primaryProviderMode.shouldPollClaude, shouldShowClaude(claudeSnapshot) {
-            entries.append(.separator)
-            entries.append(.header("Claude · 전환 보조"))
-            entries.append(contentsOf: FreshnessPresentation.secondaryEntries(snapshot: claudeSnapshot))
-            entries.append(contentsOf: claudeView.entries)
-        }
-
-        let history = UsageHistoryStore.shared.loadSummary()
-        if history.hasRecords {
-            entries.append(.separator)
-            entries.append(.header("기록"))
-            entries.append(.line("총 \(history.totalRecords)건 · Claude \(history.claudeRecords) · Codex \(history.codexRecords)"))
-            if let last = history.lastTimestamp {
-                entries.append(.line("마지막 기록 \(UsageHistoryTime.display(last))"))
-            }
-        }
+        statusItem.button?.image = statusImage(composition.image, codexView: codexView)
+        statusItem.button?.toolTip = composition.toolTip
         // The menu-bar ring and tooltip above update right away; the open menu
         // itself waits until it closes.
         if menuIsOpen {
             menuNeedsRebuild = true
         } else {
             menuNeedsRebuild = false
-            rebuildMenu(entries)
+            rebuildMenu(composition)
         }
     }
 
-    private func shouldShowClaude(_ snapshot: Snapshot?) -> Bool {
-        guard let captured = snapshot?.capturedAt else { return false }
-        return Date().timeIntervalSince1970 - captured <= 24 * 3600
+    /// Monochrome and geometry-only either way (Bar.ringImage); a reading
+    /// that stopped updating is drawn faded.
+    private func statusImage(_ image: MenuBarImage, codexView: CodexUsageView) -> NSImage? {
+        switch image {
+        case .claudeRing(let ring):
+            return Bar.ringImage(used: ring.used / 100, pace: ring.pace, dimmed: ring.dimmed)
+        case .codexRing:
+            return codexView.menuBarImage ?? unavailableStatusImage(
+                accessibilityDescription: "Codex 사용량 확인 불가"
+            )
+        case .unavailable(let description):
+            return unavailableStatusImage(accessibilityDescription: description)
+        }
     }
 
     private func unavailableStatusImage(accessibilityDescription: String) -> NSImage? {
@@ -272,65 +227,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return image
     }
 
-    /// A displayed percentage plus a broken collector means the number is real
-    /// but frozen — say so instead of letting it read as current.
-    private func collectorWarningEntries(_ state: ClaudeCollectorState?) -> [MenuEntry] {
-        guard let status = state?.parsedStatus, status.blocksCollection else { return [] }
-        var entries: [MenuEntry] = [.separator, .header("⚠ 수집 중단")]
-        entries.append(.line(status.menuDescription))
-        if let detail = state?.detail, !detail.isEmpty {
-            entries.append(.line(detail))
-        }
-        return entries
-    }
-
-    private func claudeUnavailableEntries(
-        reason: ClaudeUsageUnavailableReason
-    ) -> [MenuEntry] {
-        var entries: [MenuEntry] = [
-            .header("Claude"),
-            .line("사용량: 공식 조회값 없음"),
-            .line("한도를 추정하거나 화면에서 긁어오지 않음")
-        ]
-
-        switch reason {
-        case .missingSnapshot:
-            entries.append(.line("스냅샷 없음 · 아직 한 번도 수집되지 않음"))
-        case .staleSnapshot:
-            entries.append(.line("마지막 수집이 24시간을 넘어 표시에서 제외"))
-        case .noUsableWindow:
-            entries.append(.line("지금 쓸 수 있는 한도 값 없음 — 리셋이 지났거나 조회값에 퍼센트가 없음"))
-        case .collectorBlocked(let status):
-            entries.append(.line(status.menuDescription))
-        }
-        return entries
-    }
-
-    private func grokUnavailableEntries(
-        reason: PrimaryUsageUnavailableReason
-    ) -> [MenuEntry] {
-        var entries: [MenuEntry] = [
-            .header("Grok"),
-            .line("사용량: 공식 기계판독 불가"),
-            .line("주간 한도를 추정하거나 화면에서 긁어오지 않음")
-        ]
-
-        switch reason {
-        case .providerTransition:
-            entries.append(.line("Codex 스냅샷은 공급자 전환으로 기본 링에서 제외"))
-        case .missingCodexSnapshot:
-            entries.append(.line("Codex 스냅샷 없음 · 기본 링에서 제외"))
-        case .staleCodexSnapshot:
-            entries.append(.line("Codex 스냅샷이 10분을 넘어 기본 링에서 제외"))
-        case .invalidCodexEntitlement:
-            entries.append(.line("Codex 사용 권한을 확인할 수 없어 기본 링에서 제외"))
-        }
-        return entries
-    }
-
-    private func rebuildMenu(_ entries: [MenuEntry]) {
+    private func rebuildMenu(_ composition: MenuComposition) {
         menu.removeAllItems()
-        for e in entries {
+        for e in composition.entries {
             switch e {
             case .separator:
                 menu.addItem(.separator())
@@ -348,12 +247,45 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         menu.addItem(.separator())
+        if !composition.ringOptions.isEmpty {
+            menu.addItem(ringMenuItem(composition.ringOptions))
+        }
         let r = NSMenuItem(title: "지금 갱신", action: #selector(manualRefresh), keyEquivalent: "r")
         r.target = self
         menu.addItem(r)
         let q = NSMenuItem(title: "종료", action: #selector(quit), keyEquivalent: "q")
         q.target = self
         menu.addItem(q)
+    }
+
+    /// "메뉴바 링" and its choices. The submenu gets no delegate: the main
+    /// menu's menuWillOpen/menuDidClose drive refreshes, and opening the
+    /// submenu must not count as the menu opening again.
+    private func ringMenuItem(_ options: [RingOption]) -> NSMenuItem {
+        let submenu = NSMenu(title: "메뉴바 링")
+        submenu.autoenablesItems = false
+        for option in options {
+            let item = NSMenuItem(title: option.title, action: #selector(chooseRing(_:)), keyEquivalent: "")
+            item.target = self
+            item.isEnabled = true
+            item.state = option.isSelected ? .on : .off
+            item.representedObject = option.setting.rawValue
+            submenu.addItem(item)
+        }
+        let item = NSMenuItem(title: "메뉴바 링", action: nil, keyEquivalent: "")
+        item.submenu = submenu
+        return item
+    }
+
+    @objc private func chooseRing(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let ring = RingSetting(rawValue: raw) else { return }
+        // settings.json is written only when the choice actually changes.
+        if ring != settings.loadRing() {
+            settings.saveRing(ring)
+        }
+        // The ring and tooltip change now; an open menu is rebuilt once it closes.
+        render()
     }
 
     @objc private func manualRefresh() {

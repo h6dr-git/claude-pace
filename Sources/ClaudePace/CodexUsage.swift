@@ -66,7 +66,7 @@ struct CodexUsageView {
     }
 
     private var menuWindow: CodexRateLimitWindow? {
-        mainLimit?.primary ?? mainLimit?.secondary
+        snapshot?.menuBarWindow
     }
 
     var menuBarImage: NSImage? {
