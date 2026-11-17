@@ -81,6 +81,10 @@ struct Snapshot: Codable {
     /// Who wrote the snapshot: "usage-poll" for the `/usage` collector,
     /// nothing for the statusLine bridge.
     let source: String?
+    /// `fiveHour` as stored, before `droppingEndedWindows` blanked an ended
+    /// or out-of-range window (not in the file): what a printed session line
+    /// gave, when the reading has nothing left of it.
+    let storedFiveHour: RLWindow?
 
     init(
         capturedAt: Double?,
@@ -92,7 +96,8 @@ struct Snapshot: Codable {
         model: String?,
         fiveHourAbsentSince: Double? = nil,
         fiveHourSeenAt: Double? = nil,
-        source: String? = nil
+        source: String? = nil,
+        storedFiveHour: RLWindow? = nil
     ) {
         self.capturedAt = capturedAt
         self.fiveHour = fiveHour
@@ -104,6 +109,7 @@ struct Snapshot: Codable {
         self.fiveHourAbsentSince = fiveHourAbsentSince
         self.fiveHourSeenAt = fiveHourSeenAt
         self.source = source
+        self.storedFiveHour = storedFiveHour ?? fiveHour
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -125,6 +131,7 @@ struct Snapshot: Codable {
         fiveHourAbsentSince = try? c.decodeIfPresent(Double.self, forKey: .fiveHourAbsentSince)
         fiveHourSeenAt = try? c.decodeIfPresent(Double.self, forKey: .fiveHourSeenAt)
         source = try? c.decodeIfPresent(String.self, forKey: .source)
+        storedFiveHour = fiveHour
     }
 
     /// The snapshot as it reads at `now`: windows whose reset has passed keep
@@ -146,7 +153,8 @@ struct Snapshot: Codable {
             model: model,
             fiveHourAbsentSince: fiveHourAbsentSince,
             fiveHourSeenAt: fiveHourSeenAt,
-            source: source
+            source: source,
+            storedFiveHour: storedFiveHour
         )
     }
 

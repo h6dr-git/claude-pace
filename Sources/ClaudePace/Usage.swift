@@ -242,21 +242,22 @@ struct UsageView {
     /// Why the latest poll left the 5-hour window without a number, when it
     /// did, so the section says so instead of just going missing (drawn
     /// without a bar). Either the poll printed a session line that gave no
-    /// usable window, or it printed none while the stored window may still
-    /// be open: its reset is ahead, or, with no reset (what an unreadable
-    /// line leaves), it is under 5 hours since a poll printed the line. The
-    /// collector clears the percentage in both cases.
+    /// usable window (told apart by what the line gave, as stored), or it
+    /// printed none while the stored window may still be open: its reset is
+    /// ahead, or, with no reset (what an unreadable line leaves), it is under
+    /// 5 hours since a poll printed the line. The collector clears the
+    /// percentage of such a window.
     private func fiveHourWithoutNumberLine(_ snapshot: Snapshot) -> String? {
         guard snapshot.source == "usage-poll", let window = snapshot.fiveHour else { return nil }
         if snapshot.latestPollPrintedSessionLine {
-            if window.used_percentage == nil { return "사용률 값 없음 — 5시간 줄을 해석하지 못함" }
-            if window.resets_at == nil { return "사용률 값 없음 — 5시간 줄의 리셋 시각을 해석하지 못함" }
+            let printed = snapshot.storedFiveHour ?? window
+            if printed.used_percentage == nil { return "사용률 값 없음 — 5시간 줄을 해석하지 못함" }
+            if printed.resets_at == nil { return "사용률 값 없음 — 5시간 줄의 리셋 시각을 해석하지 못함" }
             return "사용률 값 없음 — 5시간 줄의 값이 범위를 벗어남"
         }
-        guard window.used_percentage == nil else { return nil }
         let missing = "사용률 값 없음 — 마지막 조회에 5시간 줄이 없음"
         if let reset = window.resets_at {
-            guard reset.isFinite, reset > now.timeIntervalSince1970 else { return nil }
+            guard window.used_percentage == nil, reset.isFinite, reset > now.timeIntervalSince1970 else { return nil }
             return "\(missing) (창은 \(clock(Date(timeIntervalSince1970: reset)))까지)"
         }
         guard let seen = snapshot.fiveHourSeenAt, seen.isFinite,

@@ -1611,33 +1611,49 @@ struct UsageProviderSelectionTestMain {
             }
             expectEqual(barTexts(entries).count, 1, "only the week's bar (reset \(reset))")
         }
-        // A line that was read but left no usable window says which part.
+        // A line that was read but left no usable window says which part,
+        // judged by what the line gave as stored: a reset out of range is
+        // blanked on reading, and is still not "unreadable". The same through
+        // the menu, which reads a snapshot that was already blanked.
+        let farReset = t + 3 * 86_400
         for (window, reason) in [
             (#"{"used_percentage": 30, "resets_at": null}"#, "사용률 값 없음 — 5시간 줄의 리셋 시각을 해석하지 못함"),
-            (#"{"used_percentage": 130, "resets_at": \#(fiveReset)}"#, "사용률 값 없음 — 5시간 줄의 값이 범위를 벗어남")
+            (#"{"used_percentage": 130, "resets_at": \#(fiveReset)}"#, "사용률 값 없음 — 5시간 줄의 값이 범위를 벗어남"),
+            (#"{"used_percentage": 30, "resets_at": \#(farReset)}"#, "사용률 값 없음 — 5시간 줄의 값이 범위를 벗어남"),
+            (#"{"used_percentage": null, "resets_at": \#(farReset)}"#, "사용률 값 없음 — 5시간 줄을 해석하지 못함")
         ] {
             let read = try decodeSnapshot("""
             {"capturedAt": \(t - 60), "fiveHour": \(window), "fiveHourSeenAt": \(t - 60), \
             "sevenDay": {"used_percentage": 60, "resets_at": \(weekReset)}, "source": "usage-poll"}
             """)
-            let entries = UsageView(snapshot: read, now: now).entries
-            if let header = entries.firstIndex(of: .header("5시간")) {
-                expectEqual(entries[header + 1], .line(reason), "read but unusable: \(window)")
-            } else {
-                expect(false, "a 5-hour section for \(window): \(texts(entries))")
+            let viewed = UsageView(snapshot: read, now: now).entries
+            let composed = MenuComposition.compose(
+                providerMode: .claude, claudeSnapshot: read.droppingEndedWindows(at: now), now: now
+            ).entries
+            for (via, entries) in [("view", viewed), ("menu", composed)] {
+                if let header = entries.firstIndex(of: .header("5시간")) {
+                    expectEqual(entries[header + 1], .line(reason), "read but unusable (\(via)): \(window)")
+                } else {
+                    expect(false, "a 5-hour section for \(window) (\(via)): \(texts(entries))")
+                }
             }
         }
-        // A poll without the line after an unreadable one (no reset left):
-        // the window may be open for 5 hours from that line, and says so.
-        for (seen, shown) in [(t - 600, true), (t - WindowCalc.fiveHourLength - 60, false)] {
-            let after = try decodeSnapshot("""
-            {"capturedAt": \(t - 60), "fiveHour": {"used_percentage": null, "resets_at": null}, "fiveHourSeenAt": \(seen), \
-            "sevenDay": {"used_percentage": 60, "resets_at": \(weekReset)}, "source": "usage-poll"}
-            """)
-            let lines = texts(UsageView(snapshot: after, now: now).entries)
-            expectEqual(lines.contains("사용률 값 없음 — 마지막 조회에 5시간 줄이 없음"), shown,
-                        "no reset, line seen \(Int(t - seen)) s ago: \(lines)")
-            expect(!lines.contains { $0.contains("해석하지 못함") }, "no reset, line seen \(Int(t - seen)) s ago: not unreadable")
+        // A poll without the line after one that gave no reset: the window
+        // may be open for 5 hours from that line, and says so, until exactly
+        // 5 hours on. A percentage the collector left (a snapshot from before
+        // it cleared these) does not change that.
+        let five = WindowCalc.fiveHourLength
+        for window in [#"{"used_percentage": null, "resets_at": null}"#, #"{"used_percentage": 30, "resets_at": null}"#] {
+            for (seen, shown) in [(t - 600, true), (t - 4 * 3600, true), (t - five + 1, true), (t - five, false), (t - five - 60, false)] {
+                let after = try decodeSnapshot("""
+                {"capturedAt": \(t - 60), "fiveHour": \(window), "fiveHourSeenAt": \(seen), \
+                "sevenDay": {"used_percentage": 60, "resets_at": \(weekReset)}, "source": "usage-poll"}
+                """)
+                let lines = texts(UsageView(snapshot: after, now: now).entries)
+                expectEqual(lines.contains("사용률 값 없음 — 마지막 조회에 5시간 줄이 없음"), shown,
+                            "no reset \(window), line seen \(Int(t - seen)) s ago: \(lines)")
+                expect(!lines.contains { $0.contains("해석하지 못함") }, "no reset \(window), line seen \(Int(t - seen)) s ago: not unreadable")
+            }
         }
         // A sighting the collector moved to the second before a poll without
         // the line (a clock that ran fast) is not this poll's line.
