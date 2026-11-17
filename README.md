@@ -42,7 +42,7 @@ AI_USAGE_PRIMARY_PROVIDER=claude .build/release/ClaudePace   # Codex는 codex
 
 | `AI_USAGE_PRIMARY_PROVIDER` | 메뉴바 링 | 수집 |
 |---|---|---|
-| `claude` | Claude 5시간·주간 한도 | `claude -p "/usage"` 180초마다 · `~/.claude/projects` 세션 기록 60초(처음 한 번은 30일치) |
+| `claude` | Claude 주간 전체·모델별 주간·5시간 중 바닥에 가장 가까운 한도(「메뉴바 링」에서 고정 가능) | `claude -p "/usage"` 180초마다 · `~/.claude/projects` 세션 기록 60초(처음 한 번은 30일치) |
 | `codex` | Codex 계정 한도 | `codex app-server` 조회 180초 · `~/.codex/sessions` 기록 60초 |
 | 그 밖의 값 · 없음 | `?` (확인 불가) | 없음 |
 
@@ -117,7 +117,7 @@ sleep 3; launchctl print "gui/$(id -u)/local.claude-pace" | grep -E 'state = |pi
 | `usage-daily-deltas` · `usage-monthly-summary` | 일별·월별 보고서 | `tools/usage-daily-deltas.sh` · `tools/usage-monthly-summary.sh` |
 | `menu-preview` | 지금 메뉴를 글자로 출력(현재 `HOME`·`AI_USAGE_PRIMARY_PROVIDER` 기준, 막대는 `[■■■■■■□□□□]`, 링·툴팁 포함). 조회·파일 쓰기 없음, 앱도 안 띄움 | — |
 
-인자·환경 변수·출력·종료 코드는 예전 스크립트와 같고, 일부러 바꾼 동작만 다름: 위 시간 제한, 리셋 시각을 출력 그대로 저장, 5시간 한도 없음 판단(판단한 조회는 `poll-usage` 출력 끝에 ` fiveHourAbsentSince=…`), 쓰다 만 세션 줄 뒤에 줄바꿈 없이 붙은 줄 살리기. parity 대조에 걸리는 변경은 `tests/parity/apply-intended-changes.py`에 적어 예전 스크립트 복사본에도 똑같이 적용. 모르는 명령이면 앱을 띄우지 않고 사용법을 출력한 뒤 64로 끝남. 목록은 `ClaudePace help`.
+인자·환경 변수·출력·종료 코드는 예전 스크립트와 같고, 일부러 바꾼 동작만 다름. 주요한 것: 위 시간 제한, 리셋 시각을 출력 그대로 저장, 5시간 한도 없음 판단(그렇게 보는 동안 `poll-usage` 출력 끝에 ` fiveHourAbsentSince=<판단 시각>`), 쓰다 만 세션 줄 뒤에 줄바꿈 없이 붙은 줄 살리기. 전체 목록은 `tests/parity/apply-intended-changes.py`(예전 스크립트 복사본에도 똑같이 적용해 대조)와 `tests/test-parity.sh`의 burst·partial-line 검사. 모르는 명령이면 앱을 띄우지 않고 사용법을 출력한 뒤 64로 끝남. 목록은 `ClaudePace help`.
 
 ### 스크립트 버전에서 넘어올 때
 - `git pull` 후 `swift build -c release`로 다시 빌드하고 LaunchAgent를 다시 등록(위 「업데이트」). plist는 실행 파일 경로만 맞으면 그대로 씀
