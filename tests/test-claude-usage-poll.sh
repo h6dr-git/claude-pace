@@ -507,6 +507,9 @@ run_poll "$scratch/session95.txt"
 seen="$(json capturedAt)"
 check "before the removal: 5h percent" "95" "$(json fiveHour.used_percentage)"
 check "before the removal: session line seen" "$seen" "$(json fiveHourSeenAt)"
+# A second on, as between real polls: a poll without the line never keeps a
+# sighting as late as itself (see 37).
+sleep 1
 run_poll "$scratch/week60.txt"
 check "removed mid-window: percentage blanked" "null" "$(json fiveHour.used_percentage)"
 check_instant "removed mid-window: reset kept" "$open_epoch" fiveHour.resets_at
@@ -604,14 +607,14 @@ check "legacy 5h reading, dated 5h11m before the previous poll: 5h window" "null
 check "legacy 5h reading, dated 5h11m before the previous poll: since this poll" "$(json capturedAt)" "$(json fiveHourAbsentSince)"
 
 # --- 36) a model bucket /usage left out next to the all-models line is no
-# reading any more: its percentage goes and its reset stays, so it no longer
-# reads as current or draws the ring, until a poll prints it again. Output
-# without the all-models line says nothing about the buckets.
+# reading any more: its percentage and its reset go, so it no longer reads as
+# current, draws the ring or turns up as reset later, until a poll prints it
+# again. Output without the all-models line says nothing about the buckets.
 run_poll "$scratch/full.txt"
 check "bucket printed: percent" "8" "$(json modelWindows.Opus.used_percentage)"
 run_poll "$scratch/week60.txt"
 check "bucket not printed: percentage blanked" "null" "$(json modelWindows.Opus.used_percentage)"
-check_instant "bucket not printed: reset kept" "$week_epoch" modelWindows.Opus.resets_at
+check "bucket not printed: reset dropped" "null" "$(json modelWindows.Opus.resets_at)"
 check "bucket printed alongside: percent" "91" "$(json modelWindows.Fable.used_percentage)"
 run_poll "$scratch/weekonly.txt"
 check "no bucket printed at all: each blanked" "null null" \
@@ -624,14 +627,16 @@ run_poll "$scratch/noreset.txt"
 check "no all-models line: buckets as they were" "8 null" \
   "$(json modelWindows.Opus.used_percentage) $(json modelWindows.Fable.used_percentage)"
 
-# --- 37) no sighting is later than the poll: one stored ahead of it (taken
-# while the Mac's clock ran fast, since put right) becomes this poll's time
-# instead of blocking the conclusion for as long as the clock was off. The
-# same for a reset-less window dated by a previous poll stamped ahead.
+# --- 37) no sighting is as late as a poll that printed no session line: one
+# stored ahead of it (taken while the Mac's clock ran fast, since put right)
+# becomes the second before this poll instead of blocking the conclusion for
+# as long as the clock was off. The same for a reset-less window dated by a
+# previous poll stamped ahead. Only a poll that printed the line has it at its
+# own capturedAt, which is how the menu tells an unreadable line from none.
 previous_poll 180 "$ended" $(($(date +%s) + 30 * 86400))
 run_poll "$scratch/week61.txt"
 check "sighting stored ahead: not concluded" "<missing>" "$(json fiveHourAbsentSince)"
-check "sighting stored ahead: now this poll's time" "$(json capturedAt)" "$(json fiveHourSeenAt)"
+check "sighting stored ahead: now the second before this poll" "$(($(json capturedAt) - 1))" "$(json fiveHourSeenAt)"
 # 20 minutes on, as far as that sighting goes, growth settles it as usual
 weekly_output "$scratch/week62.txt" 62 91
 edit_snapshot "capturedAt=$(($(date +%s) - 300))" "fiveHourSeenAt=$(($(json fiveHourSeenAt) - 20 * 60))"
@@ -640,7 +645,19 @@ check "sighting stored ahead, 20 minutes on: since this poll" "$(json capturedAt
 previous_poll 180 "$legacy_window"
 edit_snapshot "capturedAt=$(($(date +%s) + 30 * 86400))"
 run_poll "$scratch/week61.txt"
-check "legacy 5h reading, previous poll ahead: dated by this poll" "$(json capturedAt)" "$(json fiveHourSeenAt)"
+check "legacy 5h reading, previous poll ahead: dated the second before this poll" \
+  "$(($(json capturedAt) - 1))" "$(json fiveHourSeenAt)"
+menu="$(HOME="$fake_home" AI_USAGE_PRIMARY_PROVIDER=claude "$bin" menu-preview </dev/null)"
+check "legacy 5h reading, previous poll ahead: no unreadable line claimed" "0" "$(grep -c '해석하지 못함' <<<"$menu")"
+# An open window whose sighting was stored ahead: blanked, and the menu gives
+# the missing line as the reason, with the window's end
+open_at=$(($(date +%s) + 7200))
+previous_poll 180 "{\"used_percentage\": 30, \"resets_at\": $open_at.0}" $(($(date +%s) + 3600))
+run_poll "$scratch/week61.txt"
+check "open window, sighting stored ahead: blanked" "null" "$(json fiveHour.used_percentage)"
+menu="$(HOME="$fake_home" AI_USAGE_PRIMARY_PROVIDER=claude "$bin" menu-preview </dev/null)"
+check "open window, sighting stored ahead: the menu names the missing line" "1 0" \
+  "$(grep -c '^사용률 값 없음 — 마지막 조회에 5시간 줄이 없음 (창은 ' <<<"$menu") $(grep -c '해석하지 못함' <<<"$menu")"
 
 # --- 38) "10 minutes clear" includes exactly 10 minutes, for the reset and for
 # the sighting

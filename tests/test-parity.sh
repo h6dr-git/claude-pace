@@ -377,6 +377,16 @@ print(month, t.day, "at", "%d:50%s" % (t.hour % 12 or 12, "am" if t.hour < 12 el
   claude_poll session-unread session-unread.txt
   printf '%s' '{"capturedAt": 1793000000, "fiveHour": {"used_percentage": 9, "resets_at": 1793000000}}' > "$app/snapshot.json"
   claude_poll session-unread-ended session-unread.txt
+  # ...over every other stored shape: none, empty, a window with extra keys
+  # (kept), and something that is not a window at all.
+  printf '%s' '{"capturedAt": 1793000000, "fiveHour": null}' > "$app/snapshot.json"
+  claude_poll session-unread-null session-unread.txt
+  printf '%s' '{"capturedAt": 1793000000, "fiveHour": {}}' > "$app/snapshot.json"
+  claude_poll session-unread-empty session-unread.txt
+  printf '%s' '{"capturedAt": 1793000000, "fiveHour": {"used_percentage": 9, "resets_at": 1793000000, "extra": "kept"}}' > "$app/snapshot.json"
+  claude_poll session-unread-extra session-unread.txt
+  printf '%s' '{"capturedAt": 1793000000, "fiveHour": 5}' > "$app/snapshot.json"
+  claude_poll session-unread-number session-unread.txt
 }
 
 # --- Codex app-server polling ------------------------------------------------

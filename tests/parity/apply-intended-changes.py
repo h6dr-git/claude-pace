@@ -112,8 +112,9 @@ CHANGES = [
         # printed it as current: the limit may have gone mid-window) and keeps
         # the reset. A window without a reset and without `fiveHourSeenAt`
         # (stored before it existed) is dated by the previous poll instead, so
-        # that it can expire. No sighting is later than this poll: one stored
-        # ahead of it (a clock that ran fast) becomes this poll's time.
+        # that it can expire. No sighting is as late as this poll, which
+        # printed no session line: one stored that late (a clock that ran
+        # fast) becomes the second before this poll.
         "tools/poll-usage.sh",
         "new['sevenDay'] = window(cur.get('sevenDay') or {}, week, week_reset)\n",
         "\n"
@@ -124,21 +125,23 @@ CHANGES = [
         "if not session_line:\n"
         "    old = cur.get('fiveHour')\n"
         "    old_reset = old.get('resets_at') if isinstance(old, dict) else None\n"
-        "    if finite(cur.get('fiveHourSeenAt')) and cur['fiveHourSeenAt'] > new['capturedAt']:\n"
-        "        new['fiveHourSeenAt'] = new['capturedAt']\n"
+        "    if finite(cur.get('fiveHourSeenAt')) and cur['fiveHourSeenAt'] > new['capturedAt'] - 1:\n"
+        "        new['fiveHourSeenAt'] = new['capturedAt'] - 1\n"
         "    if finite(old_reset) and old_reset > time.time():\n"
         "        new['fiveHour'] = dict(old, used_percentage=None)\n"
         "    elif (old is not None and old != {} and not finite(old_reset)\n"
         "          and not finite(cur.get('fiveHourSeenAt')) and finite(cur.get('capturedAt'))):\n"
-        "        new['fiveHourSeenAt'] = min(cur['capturedAt'], new['capturedAt'])\n"
+        "        new['fiveHourSeenAt'] = (cur['capturedAt'] if cur['capturedAt'] <= new['capturedAt'] - 1\n"
+        "                                 else new['capturedAt'] - 1)\n"
         "new['sevenDay'] = window(cur.get('sevenDay') or {}, week, week_reset)\n",
     ),
     (
         # A poll that printed the all-models weekly line blanks the percentage
-        # of every stored model bucket it did not print (the reset stays),
-        # also when it printed no bucket at all: `/usage` stopped reporting
-        # it, so it must not stay a live reading. Without that line the
-        # buckets stay as they were; printed buckets merge as before.
+        # and the reset of every stored model bucket it did not print, also
+        # when it printed no bucket at all: `/usage` stopped reporting it, so
+        # it must not stay a live reading or turn up as reset later. Without
+        # that line the buckets stay as they were; printed buckets merge as
+        # before.
         "tools/poll-usage.sh",
         "if model_windows:\n"
         "    merged = dict(cur.get('modelWindows') or {})\n",
@@ -147,7 +150,7 @@ CHANGES = [
         "if week is not None and merged:\n"
         "    for name, w in list(merged.items()):\n"
         "        if name not in model_windows and isinstance(w, dict):\n"
-        "            merged[name] = dict(w, used_percentage=None)\n"
+        "            merged[name] = dict(w, used_percentage=None, resets_at=None)\n"
         "    new['modelWindows'] = merged\n"
         "if model_windows:\n",
     ),

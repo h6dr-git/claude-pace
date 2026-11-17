@@ -270,15 +270,18 @@ enum ClaudeUsageCollector {
         }
         // A bucket left out next to the all-models line is no reading any
         // more: `/usage` stopped printing it (a retired or renamed model, or
-        // one it does not list right now). Its percentage goes and its reset
-        // stays, so it no longer reads as current or draws the ring; a poll
-        // that prints it again brings it back. Output without the all-models
-        // line says nothing about the buckets, and they stay as they were.
+        // one it does not list right now). Its percentage and its reset go,
+        // so it no longer reads as current, draws the ring, or turns up as
+        // "reset" once that instant passes; a poll that prints it again brings
+        // it back. (No evidence reads an unprinted bucket's reset.) Output
+        // without the all-models line says nothing about the buckets, and
+        // they stay as they were.
         if week != nil, !buckets.isEmpty {
             let printed = Set(modelWindows.map { $0.name })
             for (name, value) in buckets.entries where !printed.contains(name) {
                 guard case .object(var bucket) = value else { continue }
                 bucket["used_percentage"] = .null
+                bucket["resets_at"] = .null
                 buckets[name] = .object(bucket)
             }
             snapshot["modelWindows"] = .object(buckets)
@@ -435,16 +438,20 @@ enum ClaudeUsageCollector {
     /// by the previous poll, no earlier than its real sighting, so that it
     /// ends 5 hours on instead of blocking the conclusion for good.
     ///
-    /// No sighting is later than this poll. One stored ahead of it (taken
-    /// while the Mac's clock ran fast, since put right) becomes this poll's
-    /// time: still the latest a window may have been open, but no longer a
-    /// block on the conclusion for as long as the clock was off.
+    /// No sighting is as late as this poll, which printed no session line.
+    /// One stored that late (taken while the Mac's clock ran fast, since put
+    /// right) becomes the second before this poll: still about the latest a
+    /// window may have been open, but no longer a block on the conclusion for
+    /// as long as the clock was off. Only a poll that printed the line has
+    /// `fiveHourSeenAt` equal to its own capturedAt, which is how the menu
+    /// tells an unreadable session line from a missing one.
     private static func settleWithoutSessionLine(
         _ snapshot: inout JSONObject, previous: JSONObject, at now: Date
     ) {
         let capturedAt = Int(now.timeIntervalSince1970)
-        if let seen = finiteNumber(previous["fiveHourSeenAt"]), seen > Double(capturedAt) {
-            snapshot["fiveHourSeenAt"] = .int(capturedAt)
+        let latestSighting = capturedAt - 1
+        if let seen = finiteNumber(previous["fiveHourSeenAt"]), seen > Double(latestSighting) {
+            snapshot["fiveHourSeenAt"] = .int(latestSighting)
         }
         switch storedFiveHour(previous["fiveHour"]) {
         case .resets(let reset) where reset > now.timeIntervalSince1970:
@@ -453,7 +460,7 @@ enum ClaudeUsageCollector {
             snapshot["fiveHour"] = .object(window)
         case .unbounded where finiteNumber(previous["fiveHourSeenAt"]) == nil:
             guard let then = previous["capturedAt"], let at = finiteNumber(then) else { return }
-            snapshot["fiveHourSeenAt"] = at > Double(capturedAt) ? .int(capturedAt) : then
+            snapshot["fiveHourSeenAt"] = at > Double(latestSighting) ? .int(latestSighting) : then
         default:
             break
         }
