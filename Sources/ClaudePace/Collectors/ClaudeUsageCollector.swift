@@ -138,10 +138,17 @@ enum ClaudeUsageCollector {
         options: [.caseInsensitive]
     )
 
+    /// A session limit line, readable or not. Only output without one can
+    /// count towards "this account has no 5-hour limit".
+    private static let sessionHeading = try! NSRegularExpression(
+        pattern: #"^\s*Current session\b"#,
+        options: [.anchorsMatchLines, .caseInsensitive]
+    )
+
     private static let fiveHours: Double = 5 * 3600
-    private static let oneWeek: Double = 7 * 24 * 3600
 
     private static func update(_ paths: AppPaths, from output: String, io: CommandIO) -> Int32 {
+        let now = Date()
         let text = output as NSString
         let whole = NSRange(location: 0, length: text.length)
         func group(_ match: NSTextCheckingResult, _ index: Int) -> String? {
@@ -153,7 +160,7 @@ enum ClaudeUsageCollector {
         var fiveReset: Double?
         if let match = sessionPattern.firstMatch(in: output, range: whole) {
             five = group(match, 1).flatMap { Int($0) }
-            fiveReset = UsageResetTime.epoch(text: group(match, 2), timeZoneName: group(match, 3), windowLength: fiveHours)
+            fiveReset = UsageResetTime.epoch(text: group(match, 2), timeZoneName: group(match, 3), now: now)
         }
 
         var week: Int?
@@ -162,7 +169,7 @@ enum ClaudeUsageCollector {
         for match in weekPattern.matches(in: output, range: whole) {
             let name = (group(match, 1) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard let used = group(match, 2).flatMap({ Int($0) }) else { continue }
-            let reset = UsageResetTime.epoch(text: group(match, 3), timeZoneName: group(match, 4), windowLength: oneWeek)
+            let reset = UsageResetTime.epoch(text: group(match, 3), timeZoneName: group(match, 4), now: now)
             if ["all models", "all model", "all"].contains(name.lowercased()) {
                 week = used
                 weekReset = reset
@@ -200,7 +207,7 @@ enum ClaudeUsageCollector {
             if let reset {
                 updated["resets_at"] = .number(JSONNumber(pythonFloat: reset))
             } else if case .number(let previous)? = updated["resets_at"],
-                      previous.doubleValue < Date().timeIntervalSince1970 {
+                      previous.doubleValue < now.timeIntervalSince1970 {
                 // A fresh percentage without a readable reset must not inherit
                 // one that has already passed: that instant belongs to a window
                 // that ended, and the menu would read the new number as "no
@@ -215,7 +222,7 @@ enum ClaudeUsageCollector {
             return value
         }
 
-        let capturedAt = Shell.nowSeconds()
+        let capturedAt = Int(now.timeIntervalSince1970)
         var snapshot = current
         snapshot["capturedAt"] = .int(capturedAt)
         snapshot["fiveHour"] = window(oldWindow("fiveHour"), five, fiveReset)
@@ -241,6 +248,20 @@ enum ClaudeUsageCollector {
             }
             snapshot["modelWindows"] = .object(merged)
         }
+
+        // On an account without a 5-hour limit the last window, long ended,
+        // would otherwise stay in the snapshot for good.
+        let absentSince = fiveHourAbsence(
+            before: current,
+            after: snapshot,
+            models: modelWindows.map { $0.name },
+            sessionLine: sessionHeading.firstMatch(in: output, range: whole) != nil,
+            at: capturedAt
+        )
+        if absentSince != nil {
+            snapshot["fiveHour"] = .null
+        }
+        snapshot["fiveHourAbsentSince"] = absentSince
         snapshot["source"] = .string("usage-poll")
 
         let json = JSONValue.object(snapshot).pythonText(ensureASCII: true, compact: false)
@@ -248,8 +269,82 @@ enum ClaudeUsageCollector {
         writeState(paths, "ok", "")
 
         let models = modelWindows.map { "'\($0.name)'" }.sorted().joined(separator: ", ")
-        io.out("snapshot updated: 5h=\(five.map { String($0) } ?? "None")% week=\(week.map { String($0) } ?? "None")% models=[\(models)] capturedAt=\(capturedAt)")
+        var summary = "snapshot updated: 5h=\(five.map { String($0) } ?? "None")% week=\(week.map { String($0) } ?? "None")% models=[\(models)] capturedAt=\(capturedAt)"
+        if let absentSince {
+            summary += " fiveHourAbsentSince=\(absentSince.pythonText(ensureASCII: true, compact: true))"
+        }
+        io.out(summary)
         return 0
+    }
+
+    // MARK: - Accounts without a 5-hour limit
+
+    /// `fiveHourAbsentSince` for this poll: since when the account is known
+    /// to have no 5-hour limit, or nil while it may have one.
+    ///
+    /// Verified Ultra accounts lost the limit from 2026-10-30 (Pro and Max
+    /// keep it), and `/usage` then prints no session line — the same output
+    /// as between two 5-hour windows, so a missing line proves nothing alone.
+    /// Two polls under 5 hours apart do, when weekly usage grew in between
+    /// and no 5-hour window was open at the first: with the limit, that usage
+    /// opened a window lasting 5 hours from its first message, still open at
+    /// the second poll, which would have printed the session line. (A window
+    /// already open at the first poll could have taken the usage and closed
+    /// since, which is why none may be open then.) Once concluded it holds,
+    /// with no new evidence needed, until a poll prints a session line again.
+    private static func fiveHourAbsence(
+        before previous: JSONObject,
+        after updated: JSONObject,
+        models: [String],
+        sessionLine: Bool,
+        at now: Int
+    ) -> JSONValue? {
+        guard !sessionLine else { return nil }
+        if let since = previous["fiveHourAbsentSince"], finiteNumber(since) != nil {
+            return since
+        }
+
+        guard let then = finiteNumber(previous["capturedAt"]),
+              Double(now) - then > 0, Double(now) - then < fiveHours,
+              noWindowOpen(previous["fiveHour"], at: then) else { return nil }
+        let oldBuckets = previous["modelWindows"]?.objectValue
+        let newBuckets = updated["modelWindows"]?.objectValue
+        let used = usageGrew(previous["sevenDay"], updated["sevenDay"])
+            || models.contains { usageGrew(oldBuckets?[$0], newBuckets?[$0]) }
+        return used ? .int(now) : nil
+    }
+
+    /// No 5-hour window was open at `time`: none stored, or one whose reset
+    /// had passed by then. A percentage without a readable reset may belong
+    /// to a window still open, so it proves nothing.
+    private static func noWindowOpen(_ window: JSONValue?, at time: Double) -> Bool {
+        switch window {
+        case nil, .null?:
+            return true
+        case .object(let object)?:
+            if object.isEmpty { return true }
+            guard let reset = finiteNumber(object["resets_at"]) else { return false }
+            return reset <= time
+        default:
+            return false
+        }
+    }
+
+    /// The same weekly window (an equal reset, as stored) shows a higher
+    /// percentage than before: Claude was used in between.
+    private static func usageGrew(_ before: JSONValue?, _ after: JSONValue?) -> Bool {
+        guard let old = before?.objectValue, let new = after?.objectValue,
+              let oldUsed = finiteNumber(old["used_percentage"]),
+              let newUsed = finiteNumber(new["used_percentage"]),
+              let oldReset = finiteNumber(old["resets_at"]),
+              let newReset = finiteNumber(new["resets_at"]) else { return false }
+        return newUsed > oldUsed && newReset == oldReset
+    }
+
+    /// A JSON number as a finite Double; nil for anything else.
+    private static func finiteNumber(_ value: JSONValue?) -> Double? {
+        guard case .number(let number)? = value, number.doubleValue.isFinite else { return nil }
+        return number.doubleValue
     }
 
     /// claude-collector-state.json: why this poll ended the way it did. The
@@ -262,101 +357,5 @@ enum ClaudeUsageCollector {
             "detail": .string(detail)
         ]))
         Shell.replaceAtomically(Data(state.pythonText(ensureASCII: false, compact: false).utf8), at: paths.collectorState)
-    }
-}
-
-/// Reset instants as `/usage` prints them: "Jul 22 at 8:50pm", "Jul 29 at
-/// 2pm" — no year, and ':00' dropped on whole hours. Ports `reset_epoch`,
-/// including Python's `strptime` matching rules.
-enum UsageResetTime {
-    private struct Format {
-        let regex: NSRegularExpression
-        let hasMinutes: Bool
-    }
-
-    // Python builds these from "%b %d at %I:%M%p %Y" and friends: whitespace
-    // in the format matches one or more spaces, matching ignores case, and the
-    // first match must consume the whole string.
-    private static let month = "(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)"
-    private static let day = "(3[01]|[12]\\d|0[1-9]|[1-9]| [1-9])"
-    private static let hour = "(1[0-2]|0[1-9]|[1-9])"
-    private static let minute = "([0-5]\\d|\\d)"
-    private static let ampm = "(am|pm)"
-    private static let year = "(\\d\\d\\d\\d)"
-
-    private static let formats: [Format] = [
-        Format(regex: make("\(month)\\s+\(day)\\s+at\\s+\(hour):\(minute)\(ampm)\\s+\(year)"), hasMinutes: true),
-        Format(regex: make("\(month)\\s+\(day)\\s+at\\s+\(hour)\(ampm)\\s+\(year)"), hasMinutes: false),
-        Format(regex: make("\(month)\\s+\(day)\\s+at\\s+\(hour):\(minute)\\s+\(ampm)\\s+\(year)"), hasMinutes: true),
-        Format(regex: make("\(month)\\s+\(day)\\s+at\\s+\(hour)\\s+\(ampm)\\s+\(year)"), hasMinutes: false)
-    ]
-
-    private static func make(_ pattern: String) -> NSRegularExpression {
-        try! NSRegularExpression(pattern: "^" + pattern, options: [.caseInsensitive])
-    }
-
-    private static let months = ["jan", "feb", "mar", "apr", "may", "jun",
-                                 "jul", "aug", "sep", "oct", "nov", "dec"]
-
-    /// The reset instant as epoch seconds, rolled forward by whole windows
-    /// until it is not in the past; nil when the text is not a reset time.
-    static func epoch(text: String?, timeZoneName: String?, windowLength: Double, now: Date = Date()) -> Double? {
-        guard let raw = text, !raw.isEmpty else { return nil }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        var zone = TimeZone.current
-        if let name = timeZoneName, !name.isEmpty, let named = TimeZone(identifier: name) {
-            zone = named
-        }
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = zone
-        let currentYear = calendar.component(.year, from: now)
-
-        let input = "\(trimmed) \(currentYear)"
-        let nsInput = input as NSString
-        for format in formats {
-            guard let match = format.regex.firstMatch(in: input, range: NSRange(location: 0, length: nsInput.length)),
-                  match.range.location == 0,
-                  match.range.length == nsInput.length else { continue }
-            func part(_ index: Int) -> String {
-                nsInput.substring(with: match.range(at: index))
-            }
-            guard let monthIndex = months.firstIndex(of: part(1).lowercased()),
-                  let dayValue = Int(part(2).trimmingCharacters(in: .whitespaces)),
-                  let hour12 = Int(part(3)) else { continue }
-            var group = 4
-            var minuteValue = 0
-            if format.hasMinutes {
-                guard let parsed = Int(part(group)) else { continue }
-                minuteValue = parsed
-                group += 1
-            }
-            let isPM = part(group).lowercased() == "pm"
-            guard let yearValue = Int(part(group + 1)) else { continue }
-
-            var hour24 = hour12 == 12 ? 0 : hour12
-            if isPM { hour24 += 12 }
-
-            // datetime() rejects a day the month does not have (Feb 30).
-            var components = DateComponents()
-            components.year = yearValue
-            components.month = monthIndex + 1
-            guard let firstOfMonth = calendar.date(from: components),
-                  let daysInMonth = calendar.range(of: .day, in: .month, for: firstOfMonth)?.count,
-                  dayValue >= 1, dayValue <= daysInMonth else { continue }
-
-            components.day = dayValue
-            components.hour = hour24
-            components.minute = minuteValue
-            components.second = 0
-            guard let date = calendar.date(from: components) else { continue }
-
-            // The printed instant may already have passed; walk it forward.
-            var epoch = date.timeIntervalSince1970
-            let current = now.timeIntervalSince1970
-            while epoch < current { epoch += windowLength }
-            return epoch
-        }
-        return nil
     }
 }

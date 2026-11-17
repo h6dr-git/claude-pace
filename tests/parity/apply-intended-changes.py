@@ -39,6 +39,42 @@ CHANGES = [
         "        w['resets_at'] = None\n"
         "    return w\n",
     ),
+    (
+        # A `/usage` reset instant is stored exactly as printed instead of
+        # being rolled forward by whole windows until it is not in the past.
+        # The text has no year: of last year, this year and next year, the
+        # one that puts the instant closest to now is taken (the earlier on a
+        # tie), skipping a year without that day. Rolling paired an ended
+        # window's percentage with an invented reset just after a reset, and
+        # in late December read "Jan 2" as this year's and pushed it 52 weeks
+        # on: a day early.
+        "tools/poll-usage.sh",
+        "        try:\n"
+        '            dt = datetime.datetime.strptime(f"{text} {now.year}", fmt + " %Y")\n'
+        "        except ValueError:\n"
+        "            continue\n"
+        "        if tz:\n"
+        "            dt = dt.replace(tzinfo=tz)\n"
+        "        ep = dt.timestamp()\n"
+        "        # The printed instant may already have passed (or sit a year back across\n"
+        "        # a Dec/Jan boundary); walk it forward by whole windows.\n"
+        "        while ep < time.time():\n"
+        "            ep += length\n"
+        "        return ep\n",
+        "        best, current = None, time.time()\n"
+        "        for year in (now.year - 1, now.year, now.year + 1):\n"
+        "            try:\n"
+        '                dt = datetime.datetime.strptime(f"{text} {year}", fmt + " %Y")\n'
+        "            except ValueError:\n"
+        "                continue\n"
+        "            if tz:\n"
+        "                dt = dt.replace(tzinfo=tz)\n"
+        "            ep = dt.timestamp()\n"
+        "            if best is None or abs(ep - current) < abs(best - current):\n"
+        "                best = ep\n"
+        "        if best is not None:\n"
+        "            return best\n",
+    ),
 ]
 
 

@@ -28,7 +28,6 @@ IGNORED = [re.compile(pattern) for pattern in (
 
 # Command output that is JSON (reports and summaries).
 JSON_OUTPUT = re.compile(r"(^|/)_out/\d+-(history|daily|monthly|segment)-[^/]*\.out$")
-WINDOW_LENGTHS = (0, 5 * 3600, 7 * 24 * 3600)
 
 
 def files(root):
@@ -72,17 +71,16 @@ def normalize(value, relative):
     return value
 
 
-def same(a, b, key=None):
+def same(a, b):
+    # Exact, reset instants included: they are stored as printed and no
+    # longer rolled forward from the time of the run, so runs a few seconds
+    # apart agree on them.
     if isinstance(a, bool) or isinstance(b, bool):
         return type(a) is type(b) and a == b
-    if key == "resets_at" and isinstance(a, (int, float)) and isinstance(b, (int, float)):
-        # A reset instant is rolled forward by whole windows from "now"; two
-        # runs a few seconds apart may straddle one boundary.
-        return abs(a - b) in WINDOW_LENGTHS
     if isinstance(a, dict) and isinstance(b, dict):
-        return a.keys() == b.keys() and all(same(a[k], b[k], k) for k in a)
+        return a.keys() == b.keys() and all(same(a[k], b[k]) for k in a)
     if isinstance(a, list) and isinstance(b, list):
-        return len(a) == len(b) and all(same(x, y, key) for x, y in zip(a, b))
+        return len(a) == len(b) and all(same(x, y) for x, y in zip(a, b))
     return a == b
 
 
