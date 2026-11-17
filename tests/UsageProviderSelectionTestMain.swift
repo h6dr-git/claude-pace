@@ -756,6 +756,33 @@ struct UsageProviderSelectionTestMain {
             expect(texts(composition.entries).contains("주간 전체 (7일)"), "\(name): the weekly section is not")
         }
 
+        // The real snapshot's Fable shares the week's reset, so it cannot
+        // tell which reset a tick is counted from. Here Fable resets a day
+        // out and the week two: each window's tick comes from its own reset.
+        let t = now.timeIntervalSince1970
+        let ownReset = Snapshot(
+            capturedAt: t - 60, fiveHour: nil,
+            sevenDay: RLWindow(used_percentage: 60, resets_at: t + 2 * 86_400),
+            sevenDayOpus: nil, sevenDaySonnet: nil,
+            modelWindows: ["Fable": RLWindow(used_percentage: 91, resets_at: t + 86_400)],
+            model: nil, fiveHourAbsentSince: t - 86_400, source: "usage-poll"
+        )
+        let fableOwn = MenuComposition.compose(providerMode: .claude, claudeSnapshot: ownReset, now: now)
+        expectEqual(fableOwn.ring?.window, .model("Fable"), "own reset: auto picks Fable")
+        // Six of Fable's seven days have gone; the week's five would be wrong.
+        expect(
+            abs((fableOwn.ring?.pace ?? -1) - 6.0 / 7) < 1e-9,
+            "own reset: the tick is Fable's elapsed week (6/7), not the week's (5/7): \(String(describing: fableOwn.ring?.pace))"
+        )
+        let weekOwn = MenuComposition.compose(
+            providerMode: .claude, claudeSnapshot: ownReset, ringSetting: .pinned(.week), now: now
+        )
+        expectEqual(weekOwn.ring?.window, .week, "own reset: the pinned week is drawn")
+        expect(
+            abs((weekOwn.ring?.pace ?? -1) - 5.0 / 7) < 1e-9,
+            "own reset: its tick is the week's own (5/7), not Fable's (6/7): \(String(describing: weekOwn.ring?.pace))"
+        )
+
         // Older than ten minutes: still the same window, drawn faded.
         let stale = MenuComposition.compose(
             providerMode: .claude, claudeSnapshot: try absentSnapshot(),

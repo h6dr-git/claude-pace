@@ -179,7 +179,12 @@ struct CodexUsageView {
             let label = "\(name) · \(windowLabel(window.windowDurationMins))"
             if index > 0 { entries.append(.separator) }
             entries.append(.header(label))
-            let used = window.usedPercent ?? 0
+            // No percentage is no reading: said as such, never drawn as 0%
+            // with a projection made from that 0%.
+            guard let used = window.usedPercent, used.isFinite else {
+                entries.append(.line("사용률 값 없음 — 조회값에 퍼센트가 없음"))
+                continue
+            }
             let calc = calculation(for: window)
             var detail = "사용 \(codexPercent(used))"
             if let projected = calc?.projected {
@@ -192,12 +197,14 @@ struct CodexUsageView {
         }
     }
 
+    /// nil without a percentage: there is no pace to work out from nothing.
     private func calculation(for window: CodexRateLimitWindow) -> WindowCalc? {
-        guard let reset = window.resetsAt,
+        guard let used = window.usedPercent, used.isFinite,
+              let reset = window.resetsAt,
               let minutes = window.windowDurationMins,
               minutes > 0 else { return nil }
         return WindowCalc(
-            used: window.usedPercent ?? 0,
+            used: used,
             resetsAt: Date(timeIntervalSince1970: reset),
             length: minutes * 60
         )

@@ -403,6 +403,32 @@ line "last hour" "남은 36% · 리셋까지 9분"
 absent "last hour" "시간당"
 dump "last hour" "$mark"
 
+# --- 15) a Codex window the app-server gave no percentage: said as such, not
+# drawn as "사용 0%" with a projection made from that 0%; the other window
+# keeps its bar. Its own HOME, so no Claude block sits underneath.
+codex_home="$scratch/codex-home"
+mkdir -p "$codex_home/Library/Application Support/ClaudePace"
+fresh="$(date +%s)"
+cat > "$codex_home/Library/Application Support/ClaudePace/codex-snapshot.json" <<JSON
+{"schema": "codex-usage.v1", "source": "codex-app-server", "capturedAt": $((fresh - 60)),
+ "rateLimits": {"limitId": "codex", "planType": "pro",
+   "primary": {"usedPercent": null, "windowDurationMins": 300, "resetsAt": $((fresh + 3600))},
+   "secondary": {"usedPercent": 50, "windowDurationMins": 10080, "resetsAt": $((fresh + 3 * 86400))}}}
+JSON
+mark=$failures
+preview codex "$codex_home"
+check_run "codex, no percentage"
+[ "$(awk 'prev == "전체 · 5시간" { print; exit } { prev = $0 }' "$out")" = "사용률 값 없음 — 조회값에 퍼센트가 없음" ] \
+  || fail "codex, no percentage: the 5-hour header is not followed by the no-value line"
+line "codex, no percentage" "전체 · 7일"
+prefix "codex, no percentage" "[■■■■■□□□□□] 사용 50% · 예상 "
+[ "$(grep -c '^\[' "$out")" -eq 1 ] || fail "codex, no percentage: a bar other than the 7-day window's"
+absent "codex, no percentage" "사용 0%"
+absent "codex, no percentage" "예상 0%"
+line "codex, no percentage" "ring: ?"
+line "codex, no percentage" "tooltip: AI Usage · Codex"
+dump "codex, no percentage" "$mark"
+
 if [ "$failures" -ne 0 ]; then
   echo "FAIL: $failures menu-preview assertions failed" >&2
   exit 1
