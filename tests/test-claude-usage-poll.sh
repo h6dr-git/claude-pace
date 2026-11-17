@@ -381,16 +381,71 @@ check "model growth: output" \
   "snapshot updated: 5h=None% week=60% models=['Fable'] capturedAt=$(json capturedAt) fiveHourAbsentSince=$(json capturedAt)" \
   "$output"
 
-# --- 25) a session line that cannot be read still means a 5-hour limit
+# --- 25) a session line that cannot be read still means a 5-hour limit, and a
+# window that may be open: no reset, so nothing reads it as ended
 printf '%s\n' 'Current session: ?% used' \
   "Current week (all models): 62% used · resets $weekly_reset (Asia/Seoul)" > "$scratch/session-unread.txt"
 previous_poll 180 null
 edit_snapshot "fiveHourAbsentSince=$(($(date +%s) - 3600))"
 run_poll "$scratch/session-unread.txt"
 check "unreadable session line: absence dropped" "<missing>" "$(json fiveHourAbsentSince)"
-check "unreadable session line: no 5h reading" "{}" "$(json fiveHour)"
+check "unreadable session line: no 5h reading" '{"resets_at": null}' "$(json fiveHour)"
 check "unreadable session line: week percent" "62" "$(json sevenDay.used_percentage)"
 check "unreadable session line: state" "ok" "$(field "$appdir/claude-collector-state.json" status)"
+
+# --- 26) the ended window kept from before loses its passed reset there too,
+# so growth by the next poll, which prints no session line, proves nothing: the
+# window that poll saw may have taken the usage and ended in between. A reset
+# still ahead is the open window's, and stays.
+printf '%s\n' "Current session (5h): 30% used · resets $session_reset (Asia/Seoul)" \
+  "Current week (all models): 60% used · resets $weekly_reset (Asia/Seoul)" > "$scratch/session-reshaped.txt"
+previous_poll 180 "$ended"
+run_poll "$scratch/session-reshaped.txt"
+check "unreadable session line, ended window: reset dropped" \
+  '{"resets_at": null, "used_percentage": 9}' "$(json fiveHour)"
+edit_snapshot "capturedAt=$(($(date +%s) - 180))"
+run_poll "$scratch/week61.txt"
+check "growth after an unreadable session line: kept" \
+  '{"resets_at": null, "used_percentage": 9}' "$(json fiveHour)"
+check "growth after an unreadable session line: not concluded" "<missing>" "$(json fiveHourAbsentSince)"
+open_window="{\"used_percentage\": 30, \"resets_at\": $(($(date +%s) + 7200)).0}"
+previous_poll 180 "$open_window"
+run_poll "$scratch/session-reshaped.txt"
+check "unreadable session line, open window: kept" "$(canonical "$open_window")" "$(json fiveHour)"
+
+# --- 27) the evidence keeps 10 minutes clear of both bounds. capturedAt is
+# stamped once the CLI has returned, a little after /usage looked, and /usage
+# prints resets to the minute: a printed reset 5 seconds before the previous
+# poll's capturedAt may belong to a window still open when that poll looked
+t0=$(($(date +%s) - 180))
+just_closed="{\"used_percentage\": 97, \"resets_at\": $((t0 - 5)).0}"
+previous_poll 180 "$just_closed"
+edit_snapshot "capturedAt=$t0"
+run_poll "$scratch/week61.txt"
+check "reset just before the previous poll: kept" "$(canonical "$just_closed")" "$(json fiveHour)"
+check "reset just before the previous poll: not concluded" "<missing>" "$(json fiveHourAbsentSince)"
+
+# --- 28) ...and polls stamped 4h55m apart may have looked over 5 hours apart
+previous_poll $((4 * 3600 + 55 * 60)) "$ended"
+run_poll "$scratch/week61.txt"
+check "polls 4h55m apart: ended window kept" "$(canonical "$ended")" "$(json fiveHour)"
+check "polls 4h55m apart: not concluded" "<missing>" "$(json fiveHourAbsentSince)"
+
+# --- 29) a window that ended 15 minutes before a previous poll 4h45m back is
+# clear of both, and settles it
+t0=$(($(date +%s) - 4 * 3600 - 45 * 60))
+previous_poll $((4 * 3600 + 45 * 60)) "{\"used_percentage\": 40, \"resets_at\": $((t0 - 15 * 60)).0}"
+edit_snapshot "capturedAt=$t0"
+run_poll "$scratch/week61.txt"
+check "clear of both bounds: 5h window" "null" "$(json fiveHour)"
+check "clear of both bounds: since this poll" "$(json capturedAt)" "$(json fiveHourAbsentSince)"
+
+# --- 30) a previous poll stamped after this one (the clock was set back, or the
+# file edited) proves nothing
+previous_poll -600 "$ended"
+run_poll "$scratch/week61.txt"
+check "previous poll in the future: ended window kept" "$(canonical "$ended")" "$(json fiveHour)"
+check "previous poll in the future: not concluded" "<missing>" "$(json fiveHourAbsentSince)"
 
 if [ "$failures" -ne 0 ]; then
   echo "FAIL: $failures claude-usage-poll assertions failed" >&2
