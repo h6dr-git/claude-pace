@@ -267,7 +267,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for option in options {
             let item = NSMenuItem(title: option.title, action: #selector(chooseRing(_:)), keyEquivalent: "")
             item.target = self
-            item.isEnabled = true
+            item.isEnabled = option.isEnabled
             item.state = option.isSelected ? .on : .off
             item.representedObject = option.setting.rawValue
             submenu.addItem(item)

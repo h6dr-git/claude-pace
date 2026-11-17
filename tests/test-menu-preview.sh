@@ -105,7 +105,7 @@ preview claude
 check_run "ultra"
 line "ultra" "5시간 한도 없는 계정 · 주간 한도만 적용 ($(month_day "$absent_since") 확인)"
 line "ultra" "Fable 주간 · 링"
-line "ultra" "주간 (7일)"
+line "ultra" "주간 전체 (7일)"
 prefix "ultra" "[■■■■■■■■■□] 사용 91% · 예상 "
 prefix "ultra" "[■■■■■■□□□□] 사용 60% · 예상 "
 prefix "ultra" "남은 40% · 리셋까지 하루 "
@@ -132,7 +132,7 @@ check_run "pinned five"
 line "pinned five" "링: 5시간 지금 값 없음 · 자동으로 표시"
 line "pinned five" "ring: Fable 주간 91%"
 line "pinned five" "Fable 주간 · 링"
-line "pinned five" "메뉴바 링 ▸ 자동 (가장 많이 쓴 한도) | 주간 전체 | Fable 주간"
+line "pinned five" "메뉴바 링 ▸ 자동 (가장 많이 쓴 한도) | 주간 전체 | Fable 주간 | ✓5시간 (지금 값 없음)"
 [ "$(manifest "$home")" = "$before" ] || fail "pinned five: menu-preview changed files under HOME"
 dump "pinned five" "$mark"
 
@@ -141,7 +141,7 @@ printf '{"schema":"claudepace-settings.v1","ring":"week"}\n' > "$app/settings.js
 mark=$failures
 preview claude
 check_run "pinned week"
-line "pinned week" "주간 (7일) · 링"
+line "pinned week" "주간 전체 (7일) · 링"
 line "pinned week" "Fable 주간"
 line "pinned week" "ring: 주간 전체 60%"
 line "pinned week" "메뉴바 링 ▸ 자동 (가장 많이 쓴 한도) | ✓주간 전체 | Fable 주간"
@@ -251,7 +251,7 @@ write_state "$captured"
 mark=$failures
 preview claude
 check_run "absurd bucket reset"
-line "absurd bucket reset" "주간 (7일) · 링"
+line "absurd bucket reset" "주간 전체 (7일) · 링"
 line "absurd bucket reset" "ring: 주간 전체 60%"
 line "absurd bucket reset" "메뉴바 링 ▸ ✓자동 (가장 많이 쓴 한도) | 주간 전체"
 absent "absurd bucket reset" "Fable"

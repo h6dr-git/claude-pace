@@ -739,7 +739,7 @@ struct UsageProviderSelectionTestMain {
             expect(composition.ring?.dimmed == false, "\(name): a two-minute-old reading is not dimmed")
             expect(composition.toolTip.hasPrefix("AI Usage · Claude · 링 Fable 주간 91% · 주 60%"), "\(name): tooltip names the ring: \(composition.toolTip)")
             expect(texts(composition.entries).contains("Fable 주간 · 링"), "\(name): the Fable section is marked")
-            expect(texts(composition.entries).contains("주간 (7일)"), "\(name): the weekly section is not")
+            expect(texts(composition.entries).contains("주간 전체 (7일)"), "\(name): the weekly section is not")
         }
 
         // Older than ten minutes: still the same window, drawn faded.
@@ -797,7 +797,7 @@ struct UsageProviderSelectionTestMain {
         expectEqual(week?.window, .week, "a usable pinned window is kept even when another is higher")
         expect(week?.fellBackFrom == nil, "no fallback for a usable pinned window")
         let weekEntries = UsageView(snapshot: absent, now: realNow, ring: week).entries
-        expect(texts(weekEntries).contains("주간 (7일) · 링"), "the pinned weekly section is marked")
+        expect(texts(weekEntries).contains("주간 전체 (7일) · 링"), "the pinned weekly section is marked")
         expect(!texts(weekEntries).contains { $0.hasPrefix("링:") }, "no fallback line when the pin holds")
 
         let fable = RingChoice.choose(.pinned(.model("fable")), in: absent, at: realNow)
@@ -871,8 +871,10 @@ struct UsageProviderSelectionTestMain {
         let day: TimeInterval = 86_400
         let hour: TimeInterval = 3600
         expectEqual(UsageView.planningLine(used: 60, remaining: 2 * day), "남은 40% · 리셋까지 하루 20%씩", "a day or more left: per day")
-        expectEqual(UsageView.planningLine(used: 60, remaining: 1.5 * day), "남은 40% · 리셋까지 하루 26.7%씩", "one decimal at most")
-        expectEqual(UsageView.planningLine(used: 0, remaining: 3 * day), "남은 100% · 리셋까지 하루 33.3%씩", "rounded to one decimal")
+        expectEqual(UsageView.planningLine(used: 60, remaining: 1.5 * day), "남은 40% · 리셋까지 하루 27%씩", "from 10% up: whole percent")
+        expectEqual(UsageView.planningLine(used: 0, remaining: 3 * day), "남은 100% · 리셋까지 하루 33%씩", "rounded to a whole percent")
+        expectEqual(UsageView.planningLine(used: 52, remaining: 5 * day), "남은 48% · 리셋까지 하루 9.6%씩", "under 10%: one decimal")
+        expectEqual(UsageView.planningLine(used: 50.2, remaining: 5 * day), "남은 50% · 리셋까지 하루 10%씩", "9.96 rounds up to a whole 10%")
         expectEqual(UsageView.planningLine(used: 66, remaining: day), "남은 34% · 리셋까지 하루 34%씩", "exactly 24h left is still per day")
         expectEqual(UsageView.planningLine(used: 91, remaining: 3 * hour), "남은 9% · 리셋까지 시간당 3%씩", "under a day left: per hour")
         expectEqual(UsageView.planningLine(used: 90, remaining: 4 * hour), "남은 10% · 리셋까지 시간당 2.5%씩", "per-hour decimals")
@@ -884,7 +886,7 @@ struct UsageProviderSelectionTestMain {
         expect(UsageView.planningLine(used: 40, remaining: 30) == nil, "under a minute left: no line")
 
         let weekly = UsageView(snapshot: try? absentSnapshot(), now: realNow).entries
-        let weekSection = section("주간 (7일)", in: weekly) ?? []
+        let weekSection = section("주간 전체 (7일)", in: weekly) ?? []
         expect(texts(weekSection).last?.hasPrefix("남은 40% · 리셋까지 하루 ") == true, "the weekly section ends with its planning line")
         let fableSection = section("Fable 주간", in: weekly) ?? []
         expect(texts(fableSection).last?.hasPrefix("남은 9% · 리셋까지 하루 ") == true, "every bucket gets its planning line")
@@ -1037,7 +1039,22 @@ struct UsageProviderSelectionTestMain {
         expectEqual(auto.map(\.setting), [.auto, .pinned(.week), .pinned(.model("Fable"))], "items carry their setting")
 
         let pinnedFive = RingChoice.options(for: .pinned(.five), in: absent, at: realNow)
-        expect(!pinnedFive.contains { $0.isSelected }, "a pinned window that is not listed checks nothing")
+        expectEqual(
+            pinnedFive.map(\.title),
+            ["자동 (가장 많이 쓴 한도)", "주간 전체", "Fable 주간", "5시간 (지금 값 없음)"],
+            "a pinned window without a reading stays listed, last"
+        )
+        expectEqual(pinnedFive.map(\.isSelected), [false, false, false, true], "and keeps the checkmark")
+        expectEqual(pinnedFive.map(\.isEnabled), [true, true, true, false], "greyed out: nothing to switch to")
+        expectEqual(pinnedFive.last?.setting, .pinned(.five), "it still carries the pinned setting")
+        let pinnedGone = RingChoice.options(for: .pinned(.model("Opus")), in: nil, at: realNow)
+        expectEqual(
+            pinnedGone.map(\.title),
+            ["자동 (가장 많이 쓴 한도)", "주간 전체", "Opus 주간 (지금 값 없음)"],
+            "with no reading shown the pinned bucket is still listed"
+        )
+        let pinnedWeek = RingChoice.options(for: .pinned(.week), in: nil, at: realNow)
+        expectEqual(pinnedWeek.map(\.isSelected), [false, true], "a pinned week is always listed, never twice")
 
         let t = now.timeIntervalSince1970
         let pro = Snapshot(
@@ -1185,11 +1202,11 @@ struct UsageProviderSelectionTestMain {
         // The all-models week and the 5-hour window, the same way.
         let fiveOpen = RLWindow(used_percentage: 22, resets_at: t + 3600)
         let weekEntries = UsageView(snapshot: snapshot(five: fiveOpen, week: absurd), now: now).entries
-        expect(section("주간 (7일)", in: weekEntries) == nil, "a weekly reset of 1e19 shows no weekly section")
+        expect(section("주간 전체 (7일)", in: weekEntries) == nil, "a weekly reset of 1e19 shows no weekly section")
         expect(section("5시간", in: weekEntries) != nil, "while the 5-hour reading still shows")
         let fiveEntries = UsageView(snapshot: snapshot(five: absurd, week: weekly), now: now).entries
         expect(section("5시간", in: fiveEntries) == nil, "a 5-hour reset of 1e19 shows no 5-hour section")
-        expect(section("주간 (7일)", in: fiveEntries) != nil, "while the week still shows")
+        expect(section("주간 전체 (7일)", in: fiveEntries) != nil, "while the week still shows")
 
         // The bound: the window's own length plus a day of slack.
         func kept(_ reset: Double, _ length: TimeInterval) -> Bool {

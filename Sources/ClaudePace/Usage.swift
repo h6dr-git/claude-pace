@@ -107,16 +107,15 @@ struct UsageView {
         let fiveEnded = snapshot.hasNoFiveHourLimit
             ? nil : endedLine(snapshot.reading(snapshot.fiveHour, at: now), fiveHour: true)
         if let w = week {
-            e.append(.header(title("주간 (7일)", .week)))
+            e.append(.header(title("주간 전체 (7일)", .week)))
             appendWeekly(w, resetLine: true, to: &e)
         } else if let weekEnded {
-            e.append(.header("주간 (7일)"))
+            e.append(.header("주간 전체 (7일)"))
             e.append(.line(weekEnded))
         }
-        if snapshot.hasNoFiveHourLimit {
-            e.append(.separator)
-            e.append(.line(noFiveHourLimitLine(since: snapshot.fiveHourAbsentSince)))
-        } else if let f = five {
+        // Neither is set for an account without a 5-hour limit: that is said
+        // once, after the limits that do apply (below the buckets).
+        if let f = five {
             e.append(.separator)
             e.append(.header(title("5시간", .five)))
             e.append(.bar(used: f.used / 100, pace: f.elapsedFrac, text: "사용 \(pct(f.used))"))
@@ -128,6 +127,10 @@ struct UsageView {
         }
         let buckets = bucketEntries(snapshot)
         e.append(contentsOf: buckets)
+        if snapshot.hasNoFiveHourLimit {
+            e.append(.separator)
+            e.append(.line(noFiveHourLimitLine(since: snapshot.fiveHourAbsentSince)))
+        }
         if week == nil && five == nil && weekEnded == nil && fiveEnded == nil && buckets.isEmpty {
             e.append(.line("한도 값 없음 — 공식 조회에서 퍼센트를 받지 못함"))
         }
@@ -323,11 +326,13 @@ private func verdict(_ v: PaceVerdict) -> String {
     }
 }
 
-/// A planning rate: at most one decimal, no trailing ".0". One that rounds
-/// to nothing says so rather than reading as 0%.
+/// A planning rate: whole percent from 10% up, below that at most one
+/// decimal with no trailing ".0". One that rounds to nothing says so rather
+/// than reading as 0%.
 private func rateText(_ rate: Double) -> String {
     let tenths = (rate * 10).rounded()
     guard tenths >= 1 else { return "0.1% 미만" }
+    if tenths >= 100 { return "\(Int(rate.rounded()))%씩" }
     if tenths.truncatingRemainder(dividingBy: 10) == 0 { return "\(Int(tenths / 10))%씩" }
     return String(format: "%.1f%%씩", tenths / 10)
 }

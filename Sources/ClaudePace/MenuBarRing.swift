@@ -139,6 +139,14 @@ struct RingChoice: Equatable {
             if case .pinned(let pinned) = setting { selected = pinned.matches(window) }
             options.append(RingOption(title: window.label, setting: .pinned(window), isSelected: selected))
         }
+        // A pinned window with no reading right now stays visible, checked
+        // and greyed out, so the current setting is never missing from the
+        // list (the ring meanwhile falls back to auto and the menu says so).
+        if case .pinned(let pinned) = setting, !windows.contains(where: { $0.matches(pinned) }) {
+            options.append(RingOption(
+                title: "\(pinned.label) (지금 값 없음)", setting: setting, isSelected: true, isEnabled: false
+            ))
+        }
         return options
     }
 }
@@ -149,6 +157,9 @@ struct RingOption: Equatable {
     let setting: RingSetting
     /// Checkmark: this is the current setting.
     let isSelected: Bool
+    /// False for a pinned window that has no reading right now: shown so the
+    /// setting stays visible, but there is nothing to switch to.
+    var isEnabled: Bool = true
 }
 
 // MARK: - settings.json
